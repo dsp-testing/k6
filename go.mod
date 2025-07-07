@@ -19,7 +19,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/grafana/sobek v0.0.0-20250320150027-203dc85b6d98
 	github.com/grafana/xk6-dashboard v0.7.5
-	github.com/grafana/xk6-redis v0.3.3
+	github.com/grafana/xk6-redis v0.3.4
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 	github.com/influxdata/influxdb1-client v0.0.0-20190402204710-8ff2fc3824fc
 	github.com/jhump/protoreflect v1.17.0
@@ -51,12 +51,12 @@ require (
 	go.opentelemetry.io/otel/trace v1.35.0
 	go.opentelemetry.io/proto/otlp v1.5.0
 	go.uber.org/goleak v1.3.0
-	golang.org/x/crypto v0.36.0
+	golang.org/x/crypto v0.39.0
 	golang.org/x/crypto/x509roots/fallback v0.0.0-20250210163342-e47973b1c108
-	golang.org/x/net v0.37.0
-	golang.org/x/sync v0.12.0
-	golang.org/x/term v0.30.0
-	golang.org/x/time v0.11.0
+	golang.org/x/net v0.41.0
+	golang.org/x/sync v0.15.0
+	golang.org/x/term v0.32.0
+	golang.org/x/time v0.12.0
 	google.golang.org/grpc v1.71.0
 	google.golang.org/protobuf v1.36.6
 	gopkg.in/guregu/null.v3 v3.3.0
@@ -93,8 +93,8 @@ require (
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
-	golang.org/x/sys v0.31.0 // indirect
-	golang.org/x/text v0.23.0 // indirect
+	golang.org/x/sys v0.33.0 // indirect
+	golang.org/x/text v0.26.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20250218202821-56aae31c358a // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250218202821-56aae31c358a // indirect
 	gopkg.in/cenkalti/backoff.v1 v1.1.0 // indirect
