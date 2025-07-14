@@ -478,7 +478,13 @@ type ServeOptions struct {
 	Keyfile   string
 	Certfile  string
 	Fallback  string
+	CORS      CORSOptions
 	OnRequest func(ServeOnRequestArgs)
+}
+
+// Documentation: https://esbuild.github.io/api/#cors
+type CORSOptions struct {
+	Origin []string
 }
 
 type ServeOnRequestArgs struct {
@@ -495,7 +501,9 @@ type ServeResult struct {
 	Hosts []string
 }
 
+// Documentation: https://esbuild.github.io/api/#watch-arguments
 type WatchOptions struct {
+	Delay int // In milliseconds
 }
 
 type BuildContext interface {

@@ -1357,6 +1357,17 @@ func ScanBundle(
 		}
 	}()
 
+	// Always consume all unused results. Failing to do so could cause a memory
+	// leak if a build is cancelled. We can't cancel the producers by closing the
+	// channel because doing so in Go causes a panic (which is arguably a design
+	// bug with Go).
+	defer func() {
+		for s.remaining > 0 {
+			<-s.resultChannel
+			s.remaining--
+		}
+	}()
+
 	// Wait for all "onStart" plugins here before continuing. People sometimes run
 	// setup code in "onStart" that "onLoad" expects to be able to use without
 	// "onLoad" needing to block on the completion of their "onStart" callback.
@@ -1616,6 +1627,7 @@ func (s *scanner) preprocessInjectedFiles() {
 			KeyPath:        visitedKey,
 			PrettyPath:     resolver.PrettyPath(s.fs, visitedKey),
 			IdentifierName: js_ast.EnsureValidIdentifier(visitedKey.Text),
+			Contents:       define.Source.Contents,
 		}
 
 		// The first "len(InjectedDefine)" injected files intentionally line up
