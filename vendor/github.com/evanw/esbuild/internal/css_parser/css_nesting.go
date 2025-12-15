@@ -22,7 +22,8 @@ func (p *parser) lowerNestingInRule(rule css_ast.Rule, results []css_ast.Rule) [
 			}
 		}
 
-		parentSelectors := make([]css_ast.ComplexSelector, 0, len(r.Selectors))
+		parentSelectorsWithPseudo := make([]css_ast.ComplexSelector, 0, len(r.Selectors))
+		parentSelectorsNoPseudo := make([]css_ast.ComplexSelector, 0, len(r.Selectors))
 		for i, sel := range r.Selectors {
 			// Top-level "&" should be replaced with ":scope" to avoid recursion.
 			// From https://www.w3.org/TR/css-nesting-1/#nest-selector:
@@ -41,15 +42,21 @@ func (p *parser) lowerNestingInRule(rule css_ast.Rule, results []css_ast.Rule) [
 			// Filter out pseudo elements because they are ignored by nested style
 			// rules. This is because pseudo-elements are not valid within :is():
 			// https://www.w3.org/TR/selectors-4/#matches-pseudo. This restriction
-			// may be relaxed in the future, but this restriction hash shipped so
+			// may be relaxed in the future, but this restriction has shipped so
 			// we're stuck with it: https://github.com/w3c/csswg-drafts/issues/7433.
 			//
 			// Note: This is only for the parent selector list that is used to
 			// substitute "&" within child rules. Do not filter out the pseudo
 			// element from the top-level selector list.
 			if !sel.UsesPseudoElement() {
-				parentSelectors = append(parentSelectors, css_ast.ComplexSelector{Selectors: substituted})
+				parentSelectorsNoPseudo = append(parentSelectorsNoPseudo, css_ast.ComplexSelector{Selectors: substituted})
 			}
+
+			// This filtering is only done conditionally because it seems to only
+			// apply sometimes. Specifically it doesn't seem to apply when the
+			// nested rule is an at-rule. So we use the unfiltered list in that
+			// case. See: https://github.com/evanw/esbuild/issues/4265
+			parentSelectorsWithPseudo = append(parentSelectorsWithPseudo, css_ast.ComplexSelector{Selectors: substituted})
 		}
 
 		// Emit this selector before its nested children
@@ -58,8 +65,9 @@ func (p *parser) lowerNestingInRule(rule css_ast.Rule, results []css_ast.Rule) [
 
 		// Lower all children and filter out ones that become empty
 		context := lowerNestingContext{
-			parentSelectors: parentSelectors,
-			loweredRules:    results,
+			parentSelectorsWithPseudo: parentSelectorsWithPseudo,
+			parentSelectorsNoPseudo:   parentSelectorsNoPseudo,
+			loweredRules:              results,
 		}
 		r.Rules = p.lowerNestingInRulesAndReturnRemaining(r.Rules, &context)
 
@@ -101,14 +109,46 @@ func (p *parser) lowerNestingInRulesAndReturnRemaining(rules []css_ast.Rule, con
 	return rules[:n]
 }
 
+func compoundSelectorTermCount(sel css_ast.CompoundSelector) int {
+	count := 0
+	for _, ss := range sel.SubclassSelectors {
+		count++
+		if list, ok := ss.Data.(*css_ast.SSPseudoClassWithSelectorList); ok {
+			count += complexSelectorTermCount(list.Selectors)
+		}
+	}
+	return count
+}
+
+func complexSelectorTermCount(selectors []css_ast.ComplexSelector) int {
+	count := 0
+	for _, sel := range selectors {
+		for _, inner := range sel.Selectors {
+			count += compoundSelectorTermCount(inner)
+		}
+	}
+	return count
+}
+
+func (p *parser) addExpansionError(loc logger.Loc, n int) {
+	p.log.AddErrorWithNotes(&p.tracker, logger.Range{Loc: loc}, "CSS nesting is causing too much expansion",
+		[]logger.MsgData{{Text: fmt.Sprintf("CSS nesting expansion was terminated because a rule was generated with %d selectors. "+
+			"This limit exists to prevent esbuild from using too much time and/or memory. "+
+			"Please change your CSS to use fewer levels of nesting.", n)}})
+}
+
 type lowerNestingContext struct {
-	parentSelectors []css_ast.ComplexSelector
-	loweredRules    []css_ast.Rule
+	parentSelectorsWithPseudo []css_ast.ComplexSelector
+	parentSelectorsNoPseudo   []css_ast.ComplexSelector
+	loweredRules              []css_ast.Rule
 }
 
 func (p *parser) lowerNestingInRuleWithContext(rule css_ast.Rule, context *lowerNestingContext) css_ast.Rule {
 	switch r := rule.Data.(type) {
 	case *css_ast.RSelector:
+		oldSelectorsLen := len(r.Selectors)
+		oldSelectorsComplexity := complexSelectorTermCount(r.Selectors)
+
 		// "a { & b {} }" => "a b {}"
 		// "a { &b {} }" => "a:is(b) {}"
 		// "a { &:hover {} }" => "a:hover {}"
@@ -127,7 +167,7 @@ func (p *parser) lowerNestingInRuleWithContext(rule css_ast.Rule, context *lower
 		}
 
 		// Pass 2: Substitute "&" for the parent selector
-		if !p.options.unsupportedCSSFeatures.Has(compat.IsPseudoClass) || len(context.parentSelectors) <= 1 {
+		if !p.options.unsupportedCSSFeatures.Has(compat.IsPseudoClass) || len(context.parentSelectorsNoPseudo) <= 1 {
 			// If we can use ":is", or we don't have to because there's only one
 			// parent selector, or we are using ":is()" to match zero parent selectors
 			// (even if ":is" is unsupported), then substituting "&" for the parent
@@ -135,7 +175,7 @@ func (p *parser) lowerNestingInRuleWithContext(rule css_ast.Rule, context *lower
 			for i := range r.Selectors {
 				complex := &r.Selectors[i]
 				results := make([]css_ast.CompoundSelector, 0, len(complex.Selectors))
-				parent := p.multipleComplexSelectorsToSingleComplexSelector(context.parentSelectors)
+				parent := p.multipleComplexSelectorsToSingleComplexSelector(context.parentSelectorsNoPseudo)
 				for _, compound := range complex.Selectors {
 					results = p.substituteAmpersandsInCompoundSelector(compound, parent, results, keepLeadingCombinator)
 				}
@@ -194,7 +234,7 @@ func (p *parser) lowerNestingInRuleWithContext(rule css_ast.Rule, context *lower
 					}
 					index := indices[offset]
 					offset++
-					return context.parentSelectors[index]
+					return context.parentSelectorsNoPseudo[index]
 				}
 
 				// Do the substitution for this particular combination
@@ -213,7 +253,7 @@ func (p *parser) lowerNestingInRuleWithContext(rule css_ast.Rule, context *lower
 				carry := len(indices)
 				for carry > 0 {
 					index := &indices[carry-1]
-					if *index+1 < len(context.parentSelectors) {
+					if *index+1 < len(context.parentSelectorsNoPseudo) {
 						*index++
 						break
 					}
@@ -227,18 +267,31 @@ func (p *parser) lowerNestingInRuleWithContext(rule css_ast.Rule, context *lower
 			r.Selectors = selectors
 		}
 
+		// Put limits on the combinatorial explosion to avoid using too much time and/or memory
+		if n := len(r.Selectors); n > oldSelectorsLen && n > 0xFF00 {
+			p.addExpansionError(rule.Loc, n)
+			return css_ast.Rule{}
+		}
+		if n := complexSelectorTermCount(r.Selectors); n > oldSelectorsComplexity && n > 0xFF00 {
+			p.addExpansionError(rule.Loc, n)
+			return css_ast.Rule{}
+		}
+
 		// Lower all child rules using our newly substituted selector
 		context.loweredRules = p.lowerNestingInRule(rule, context.loweredRules)
 		return css_ast.Rule{}
 
 	case *css_ast.RKnownAt:
-		childContext := lowerNestingContext{parentSelectors: context.parentSelectors}
+		childContext := lowerNestingContext{
+			parentSelectorsWithPseudo: context.parentSelectorsWithPseudo,
+			parentSelectorsNoPseudo:   context.parentSelectorsNoPseudo,
+		}
 		r.Rules = p.lowerNestingInRulesAndReturnRemaining(r.Rules, &childContext)
 
 		// "div { @media screen { color: red } }" "@media screen { div { color: red } }"
 		if len(r.Rules) > 0 {
 			childContext.loweredRules = append([]css_ast.Rule{{Loc: rule.Loc, Data: &css_ast.RSelector{
-				Selectors: context.parentSelectors,
+				Selectors: context.parentSelectorsWithPseudo,
 				Rules:     r.Rules,
 			}}}, childContext.loweredRules...)
 		}
@@ -253,13 +306,16 @@ func (p *parser) lowerNestingInRuleWithContext(rule css_ast.Rule, context *lower
 
 	case *css_ast.RAtLayer:
 		// Lower all children and filter out ones that become empty
-		childContext := lowerNestingContext{parentSelectors: context.parentSelectors}
+		childContext := lowerNestingContext{
+			parentSelectorsWithPseudo: context.parentSelectorsWithPseudo,
+			parentSelectorsNoPseudo:   context.parentSelectorsNoPseudo,
+		}
 		r.Rules = p.lowerNestingInRulesAndReturnRemaining(r.Rules, &childContext)
 
 		// "div { @layer foo { color: red } }" "@layer foo { div { color: red } }"
 		if len(r.Rules) > 0 {
 			childContext.loweredRules = append([]css_ast.Rule{{Loc: rule.Loc, Data: &css_ast.RSelector{
-				Selectors: context.parentSelectors,
+				Selectors: context.parentSelectorsWithPseudo,
 				Rules:     r.Rules,
 			}}}, childContext.loweredRules...)
 		}
