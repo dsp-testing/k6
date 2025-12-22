@@ -88,6 +88,16 @@ func (p *parser) markSyntaxFeature(feature compat.JSFeature, r logger.Range) (di
 			"Top-level await is not available in %s", where))
 		return
 
+	case compat.ImportDefer:
+		p.log.AddError(&p.tracker, r, fmt.Sprintf(
+			"Deferred imports are not available in %s", where))
+		return
+
+	case compat.ImportSource:
+		p.log.AddError(&p.tracker, r, fmt.Sprintf(
+			"Source phase imports are not available in %s", where))
+		return
+
 	case compat.Bigint:
 		// This can't be polyfilled
 		kind := logger.Warning
@@ -345,7 +355,10 @@ func (p *parser) lowerFunction(
 			false, /* isCallTarget */
 			false, /* isDeleteTarget */
 		)
-		if !hasThisValue {
+
+		if isArrow && !p.fnOnlyDataVisit.hasThisUsage {
+			thisValue = js_ast.Expr{Loc: bodyLoc, Data: js_ast.ENullShared}
+		} else if !hasThisValue {
 			thisValue = js_ast.Expr{Loc: bodyLoc, Data: js_ast.EThisShared}
 		}
 
@@ -1142,6 +1155,7 @@ func (p *parser) lowerForAwaitLoop(loc logger.Loc, loop *js_ast.SForOf, stmts []
 		BlockLoc: loc,
 		Block: js_ast.SBlock{
 			Stmts: []js_ast.Stmt{{Loc: loc, Data: &js_ast.SFor{
+				IsLoweredForAwait: true,
 				InitOrNil: js_ast.Stmt{Loc: loc, Data: &js_ast.SLocal{Kind: js_ast.LocalVar, Decls: []js_ast.Decl{
 					{Binding: js_ast.Binding{Loc: loc, Data: &js_ast.BIdentifier{Ref: iterRef}},
 						ValueOrNil: p.callRuntime(loc, "__forAwait", []js_ast.Expr{loop.Value})},
@@ -1889,7 +1903,6 @@ func (p *parser) lowerUsingDeclarationContext() lowerUsingDeclarationContext {
 	}
 }
 
-// If this returns "nil", then no lowering needed to be done
 func (ctx *lowerUsingDeclarationContext) scanStmts(p *parser, stmts []js_ast.Stmt) {
 	for _, stmt := range stmts {
 		if local, ok := stmt.Data.(*js_ast.SLocal); ok && local.Kind.IsUsing() {
@@ -2111,25 +2124,4 @@ func (p *parser) lowerUsingDeclarationInForOf(loc logger.Loc, init *js_ast.SLoca
 	block.Stmts = ctx.finalize(p, blockStmts, p.willWrapModuleInTryCatchForUsing && p.currentScope.Parent == nil)
 	init.Kind = js_ast.LocalVar
 	id.Ref = tempRef
-}
-
-func (p *parser) maybeLowerUsingDeclarationsInSwitch(loc logger.Loc, s *js_ast.SSwitch) []js_ast.Stmt {
-	// Check for a "using" declaration in any case
-	shouldLower := false
-	for _, c := range s.Cases {
-		if p.shouldLowerUsingDeclarations(c.Body) {
-			shouldLower = true
-			break
-		}
-	}
-	if !shouldLower {
-		return nil
-	}
-
-	// If we find one, lower all cases together
-	ctx := p.lowerUsingDeclarationContext()
-	for _, c := range s.Cases {
-		ctx.scanStmts(p, c.Body)
-	}
-	return ctx.finalize(p, []js_ast.Stmt{{Loc: loc, Data: s}}, false)
 }
