@@ -44,6 +44,14 @@ func newReporter(output string, assets *assets, proc *process) *reporter {
 	return rep
 }
 
+func (rep *reporter) ServeHTTP(res http.ResponseWriter, _ *http.Request) {
+	res.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	if err := rep.exportHTML(res); err != nil {
+		http.Error(res, err.Error(), http.StatusInternalServerError)
+	}
+}
+
 func (rep *reporter) onStart() error {
 	return nil
 }
@@ -53,10 +61,11 @@ func (rep *reporter) onStop(_ error) error {
 		return nil
 	}
 
-	if rep.snapshotCount < 2 {
+	if rep.snapshotCount <= 1 {
 		rep.proc.logger.Warn(
 			"The test run was short, report generation was skipped (not enough data)",
 		)
+
 		return nil
 	}
 
@@ -123,14 +132,6 @@ func (rep *reporter) onEvent(name string, data interface{}) {
 	}
 }
 
-func (rep *reporter) ServeHTTP(res http.ResponseWriter, _ *http.Request) {
-	res.Header().Set("Content-Type", "text/html; charset=utf-8")
-
-	if err := rep.exportHTML(res); err != nil {
-		http.Error(res, err.Error(), http.StatusInternalServerError)
-	}
-}
-
 func (rep *reporter) exportJSON(out io.Writer) error {
 	rep.mu.RLock()
 	defer rep.mu.RUnlock()
@@ -154,15 +155,9 @@ func (rep *reporter) exportBase64(out io.Writer) error {
 }
 
 func (rep *reporter) exportHTML(out io.Writer) error {
-	file, err := rep.assets.report.Open("index.html")
-	if err != nil {
-		return err
-	}
+	html := rep.assets.report
 
-	html, err := io.ReadAll(file)
-	if err != nil {
-		return err
-	}
+	var err error
 
 	html, err = rep.inject(out, html, []byte(dataTag), rep.exportBase64)
 	if err != nil {
