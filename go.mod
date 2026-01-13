@@ -1,13 +1,11 @@
 module go.k6.io/k6
 
-go 1.23.0
-
-toolchain go1.23.7
+go 1.24.0
 
 require (
 	buf.build/gen/go/prometheus/prometheus/protocolbuffers/go v1.36.5-20240802094132-5b212ab78fb7.1
 	github.com/Azure/go-ntlmssp v0.0.0-20221128193559-754e69321358
-	github.com/PuerkitoBio/goquery v1.9.2
+	github.com/PuerkitoBio/goquery v1.11.0
 	github.com/Soontao/goHttpDigestClient v0.0.0-20170320082612-6d28bb1415c5
 	github.com/andybalholm/brotli v1.1.1
 	github.com/chromedp/cdproto v0.0.0-20240919203636-12af5e8a671f
@@ -51,11 +49,11 @@ require (
 	go.opentelemetry.io/otel/trace v1.35.0
 	go.opentelemetry.io/proto/otlp v1.5.0
 	go.uber.org/goleak v1.3.0
-	golang.org/x/crypto v0.36.0
+	golang.org/x/crypto v0.44.0
 	golang.org/x/crypto/x509roots/fallback v0.0.0-20250210163342-e47973b1c108
-	golang.org/x/net v0.37.0
-	golang.org/x/sync v0.12.0
-	golang.org/x/term v0.30.0
+	golang.org/x/net v0.47.0
+	golang.org/x/sync v0.18.0
+	golang.org/x/term v0.37.0
 	golang.org/x/time v0.11.0
 	google.golang.org/grpc v1.71.0
 	google.golang.org/protobuf v1.36.6
@@ -65,7 +63,7 @@ require (
 
 require (
 	buf.build/gen/go/gogo/protobuf/protocolbuffers/go v1.36.5-20210810001428-4df00b267f94.1 // indirect
-	github.com/andybalholm/cascadia v1.3.2 // indirect
+	github.com/andybalholm/cascadia v1.3.3 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bufbuild/protocompile v0.14.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
@@ -93,8 +91,8 @@ require (
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
-	golang.org/x/sys v0.31.0 // indirect
-	golang.org/x/text v0.23.0 // indirect
+	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/text v0.31.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20250218202821-56aae31c358a // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250218202821-56aae31c358a // indirect
 	gopkg.in/cenkalti/backoff.v1 v1.1.0 // indirect
