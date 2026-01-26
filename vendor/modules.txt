@@ -23,21 +23,6 @@ github.com/andybalholm/cascadia
 # github.com/beorn7/perks v1.0.1
 ## explicit; go 1.11
 github.com/beorn7/perks/quantile
-# github.com/bufbuild/protocompile v0.14.1
-## explicit; go 1.21
-github.com/bufbuild/protocompile
-github.com/bufbuild/protocompile/ast
-github.com/bufbuild/protocompile/internal
-github.com/bufbuild/protocompile/internal/editions
-github.com/bufbuild/protocompile/internal/featuresext
-github.com/bufbuild/protocompile/internal/messageset
-github.com/bufbuild/protocompile/linker
-github.com/bufbuild/protocompile/options
-github.com/bufbuild/protocompile/parser
-github.com/bufbuild/protocompile/protoutil
-github.com/bufbuild/protocompile/reporter
-github.com/bufbuild/protocompile/sourceinfo
-github.com/bufbuild/protocompile/walk
 # github.com/cenkalti/backoff/v4 v4.3.0
 ## explicit; go 1.18
 github.com/cenkalti/backoff/v4
@@ -203,15 +188,38 @@ github.com/inconshreveable/mousetrap
 github.com/influxdata/influxdb1-client/models
 github.com/influxdata/influxdb1-client/pkg/escape
 github.com/influxdata/influxdb1-client/v2
-# github.com/jhump/protoreflect v1.17.0
-## explicit; go 1.21
+# github.com/jhump/protoreflect v1.18.0
+## explicit; go 1.24.0
 github.com/jhump/protoreflect/desc
 github.com/jhump/protoreflect/desc/internal
+github.com/jhump/protoreflect/desc/internal/protoutil
 github.com/jhump/protoreflect/desc/protoparse
 github.com/jhump/protoreflect/desc/protoparse/ast
+github.com/jhump/protoreflect/desc/protoparse/internal/protocompile
+github.com/jhump/protoreflect/desc/protoparse/internal/protocompile/ast
+github.com/jhump/protoreflect/desc/protoparse/internal/protocompile/internal
+github.com/jhump/protoreflect/desc/protoparse/internal/protocompile/internal/cases
+github.com/jhump/protoreflect/desc/protoparse/internal/protocompile/internal/editions
+github.com/jhump/protoreflect/desc/protoparse/internal/protocompile/internal/ext/unsafex
+github.com/jhump/protoreflect/desc/protoparse/internal/protocompile/internal/featuresext
+github.com/jhump/protoreflect/desc/protoparse/internal/protocompile/internal/messageset
+github.com/jhump/protoreflect/desc/protoparse/internal/protocompile/linker
+github.com/jhump/protoreflect/desc/protoparse/internal/protocompile/options
+github.com/jhump/protoreflect/desc/protoparse/internal/protocompile/parser
+github.com/jhump/protoreflect/desc/protoparse/internal/protocompile/protoutil
+github.com/jhump/protoreflect/desc/protoparse/internal/protocompile/reporter
+github.com/jhump/protoreflect/desc/protoparse/internal/protocompile/sourceinfo
+github.com/jhump/protoreflect/desc/protoparse/internal/protocompile/walk
 github.com/jhump/protoreflect/desc/sourceinfo
 github.com/jhump/protoreflect/grpcreflect
 github.com/jhump/protoreflect/internal
+# github.com/jhump/protoreflect/v2 v2.0.0-beta.1
+## explicit; go 1.21
+github.com/jhump/protoreflect/v2/internal
+github.com/jhump/protoreflect/v2/internal/reparse
+github.com/jhump/protoreflect/v2/internal/sort
+github.com/jhump/protoreflect/v2/protoresolve
+github.com/jhump/protoreflect/v2/sourceinfo
 # github.com/josharian/intern v1.0.0
 ## explicit; go 1.5
 github.com/josharian/intern
@@ -264,6 +272,9 @@ github.com/mstoykov/k6-taskqueue-lib/taskqueue
 github.com/nu7hatch/gouuid
 # github.com/nxadm/tail v1.4.11
 ## explicit; go 1.13
+# github.com/petermattis/goid v0.0.0-20260113132338-7c7de50cc741
+## explicit; go 1.17
+github.com/petermattis/goid
 # github.com/pkg/browser v0.0.0-20210911075715-681adbf594b8
 ## explicit; go 1.14
 github.com/pkg/browser
@@ -549,8 +560,8 @@ google.golang.org/grpc/stats
 google.golang.org/grpc/status
 google.golang.org/grpc/tap
 google.golang.org/grpc/test/bufconn
-# google.golang.org/protobuf v1.36.6
-## explicit; go 1.22
+# google.golang.org/protobuf v1.36.11
+## explicit; go 1.23
 google.golang.org/protobuf/encoding/protojson
 google.golang.org/protobuf/encoding/prototext
 google.golang.org/protobuf/encoding/protowire
