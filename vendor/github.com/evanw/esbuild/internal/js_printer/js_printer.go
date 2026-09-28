@@ -1085,22 +1085,25 @@ func (p *printer) printProperty(property js_ast.Property) {
 	}
 
 	// Handle key syntax compression for cross-module constant inlining of enums
+	var keyFlags printExprFlags
 	if p.options.MinifySyntax && property.Flags.Has(js_ast.PropertyIsComputed) {
-		if dot, ok := property.Key.Data.(*js_ast.EDot); ok {
-			if value, ok := p.tryToGetImportedEnumValue(dot.Target, dot.Name); ok {
-				if value.String != nil {
-					property.Key.Data = &js_ast.EString{Value: value.String}
+		property.Key = p.lateConstantFoldUnaryOrBinaryOrIfExpr(property.Key)
+		keyFlags |= parentWasUnaryOrBinaryOrIfTest
 
-					// Problematic key names must stay computed for correctness
-					if !helpers.UTF16EqualsString(value.String, "__proto__") &&
-						!helpers.UTF16EqualsString(value.String, "constructor") &&
-						!helpers.UTF16EqualsString(value.String, "prototype") {
-						property.Flags &= ^js_ast.PropertyIsComputed
-					}
-				} else {
-					property.Key.Data = &js_ast.ENumber{Value: value.Number}
-					property.Flags &= ^js_ast.PropertyIsComputed
-				}
+		if key, ok := property.Key.Data.(*js_ast.EInlinedEnum); ok {
+			property.Key = key.Value
+		}
+
+		// Remove the computed flag if it's no longer needed
+		switch key := property.Key.Data.(type) {
+		case *js_ast.ENumber:
+			property.Flags &= ^js_ast.PropertyIsComputed
+
+		case *js_ast.EString:
+			if !helpers.UTF16EqualsString(key.Value, "__proto__") &&
+				!helpers.UTF16EqualsString(key.Value, "constructor") &&
+				!helpers.UTF16EqualsString(key.Value, "prototype") {
+				property.Flags &= ^js_ast.PropertyIsComputed
 			}
 		}
 	}
@@ -1167,7 +1170,7 @@ func (p *printer) printProperty(property js_ast.Property) {
 			p.options.Indent++
 			p.printIndent()
 		}
-		p.printExpr(property.Key, js_ast.LComma, 0)
+		p.printExpr(property.Key, js_ast.LComma, keyFlags)
 		if isMultiLine {
 			p.printNewline()
 			p.printExprCommentsAfterCloseTokenAtLoc(property.CloseBracketLoc)
@@ -1311,7 +1314,7 @@ func (p *printer) printProperty(property js_ast.Property) {
 		}
 
 	default:
-		p.printExpr(property.Key, js_ast.LLowest, 0)
+		p.printExpr(property.Key, js_ast.LLowest, keyFlags)
 	}
 
 	if fn, ok := property.ValueOrNil.Data.(*js_ast.EFunction); property.Kind.IsMethodDefinition() && ok {
@@ -1393,10 +1396,10 @@ func (p *printer) printQuotedUTF16(data []uint16, flags printQuotedFlags) {
 	p.print(c)
 }
 
-func (p *printer) printRequireOrImportExpr(importRecordIndex uint32, level js_ast.L, flags printExprFlags, closeParenLoc logger.Loc) {
+func (p *printer) printRequireOrImportExpr(importRecordIndex uint32, level js_ast.L, flags printExprFlags, closeParenLoc logger.Loc, phase ast.ImportPhase) {
 	record := &p.importRecords[importRecordIndex]
 
-	if level >= js_ast.LNew || (flags&forbidCall) != 0 {
+	if level >= js_ast.LNew || (flags&isNewTarget) != 0 {
 		p.print("(")
 		defer p.print(")")
 		level = js_ast.LLowest
@@ -1457,7 +1460,14 @@ func (p *printer) printRequireOrImportExpr(importRecordIndex uint32, level js_as
 		kind := ast.ImportDynamic
 		if !p.options.UnsupportedFeatures.Has(compat.DynamicImport) {
 			p.printSpaceBeforeIdentifier()
-			p.print("import(")
+			switch phase {
+			case ast.DeferPhase:
+				p.print("import.defer(")
+			case ast.SourcePhase:
+				p.print("import.source(")
+			default:
+				p.print("import(")
+			}
 		} else {
 			kind = ast.ImportRequire
 			p.printSpaceBeforeIdentifier()
@@ -1749,7 +1759,7 @@ func (p *printer) guardAgainstBehaviorChangeDueToSubstitution(expr js_ast.Expr, 
 
 // Constant folding is already implemented once in the parser. A smaller form
 // of constant folding (just for numbers) is implemented here to clean up cross-
-// module numeric constants and bitwise operations. This is not an general-
+// module numeric constants and bitwise operations. This is not a general-
 // purpose/optimal approach and never will be. For example, we can't affect
 // tree shaking at this stage because it has already happened.
 func (p *printer) lateConstantFoldUnaryOrBinaryOrIfExpr(expr js_ast.Expr) js_ast.Expr {
@@ -1979,7 +1989,7 @@ func (p *printer) printExprWithoutLeadingNewline(expr js_ast.Expr, level js_ast.
 type printExprFlags uint16
 
 const (
-	forbidCall printExprFlags = 1 << iota
+	isNewTarget printExprFlags = 1 << iota
 	forbidIn
 	hasNonOptionalChainParent
 	exprResultIsUnused
@@ -2243,7 +2253,7 @@ func (p *printer) printExpr(expr js_ast.Expr, level js_ast.L, flags printExprFla
 		p.addSourceMapping(expr.Loc)
 		p.print("new")
 		p.printSpace()
-		p.printExpr(e.Target, js_ast.LNew, forbidCall)
+		p.printExpr(e.Target, js_ast.LNew, isNewTarget)
 
 		// Omit the "()" when minifying, but only when safe to do so
 		isMultiLine := !p.options.MinifyWhitespace && ((e.IsMultiLine && len(e.Args) > 0) ||
@@ -2323,6 +2333,9 @@ func (p *printer) printExpr(expr js_ast.Expr, level js_ast.L, flags printExprFla
 				if _, ok := arg.Data.(*js_ast.ESpread); !ok {
 					if (flags & exprResultIsUnused) != 0 {
 						arg = p.astHelpers.SimplifyUnusedExpr(arg, p.options.UnsupportedFeatures)
+						if arg.Data == nil {
+							arg.Data = js_ast.EUndefinedShared
+						}
 					}
 					p.printExpr(p.guardAgainstBehaviorChangeDueToSubstitution(arg, flags), level, flags)
 					break
@@ -2360,7 +2373,7 @@ func (p *printer) printExpr(expr js_ast.Expr, level js_ast.L, flags printExprFla
 			}
 		}
 
-		wrap := level >= js_ast.LNew || (flags&forbidCall) != 0
+		wrap := level >= js_ast.LNew || (flags&isNewTarget) != 0
 		var targetFlags printExprFlags
 		if e.OptionalChain == js_ast.OptionalChainNone {
 			targetFlags = hasNonOptionalChainParent
@@ -2438,12 +2451,12 @@ func (p *printer) printExpr(expr js_ast.Expr, level js_ast.L, flags printExprFla
 
 	case *js_ast.ERequireString:
 		p.addSourceMapping(expr.Loc)
-		p.printRequireOrImportExpr(e.ImportRecordIndex, level, flags, e.CloseParenLoc)
+		p.printRequireOrImportExpr(e.ImportRecordIndex, level, flags, e.CloseParenLoc, ast.EvaluationPhase)
 
 	case *js_ast.ERequireResolveString:
 		recordLoc := p.importRecords[e.ImportRecordIndex].Range.Loc
 		isMultiLine := p.willPrintExprCommentsAtLoc(recordLoc) || p.willPrintExprCommentsAtLoc(e.CloseParenLoc)
-		wrap := level >= js_ast.LNew || (flags&forbidCall) != 0
+		wrap := level >= js_ast.LNew || (flags&isNewTarget) != 0
 		if wrap {
 			p.print("(")
 		}
@@ -2473,7 +2486,7 @@ func (p *printer) printExpr(expr js_ast.Expr, level js_ast.L, flags printExprFla
 
 	case *js_ast.EImportString:
 		p.addSourceMapping(expr.Loc)
-		p.printRequireOrImportExpr(e.ImportRecordIndex, level, flags, e.CloseParenLoc)
+		p.printRequireOrImportExpr(e.ImportRecordIndex, level, flags, e.CloseParenLoc, p.importRecords[e.ImportRecordIndex].Phase)
 
 	case *js_ast.EImportCall:
 		// Only print the second argument if either import assertions or import attributes are supported
@@ -2482,13 +2495,20 @@ func (p *printer) printExpr(expr js_ast.Expr, level js_ast.L, flags printExprFla
 			(p.willPrintExprCommentsAtLoc(e.Expr.Loc) ||
 				(printImportAssertOrWith && p.willPrintExprCommentsAtLoc(e.OptionsOrNil.Loc)) ||
 				p.willPrintExprCommentsAtLoc(e.CloseParenLoc))
-		wrap := level >= js_ast.LNew || (flags&forbidCall) != 0
+		wrap := level >= js_ast.LNew || (flags&isNewTarget) != 0
 		if wrap {
 			p.print("(")
 		}
 		p.printSpaceBeforeIdentifier()
 		p.addSourceMapping(expr.Loc)
-		p.print("import(")
+		switch e.Phase {
+		case ast.DeferPhase:
+			p.print("import.defer(")
+		case ast.SourcePhase:
+			p.print("import.source(")
+		default:
+			p.print("import(")
+		}
 		if isMultiLine {
 			p.printNewline()
 			p.options.Indent++
@@ -2538,13 +2558,13 @@ func (p *printer) printExpr(expr js_ast.Expr, level js_ast.L, flags printExprFla
 				break
 			}
 		} else {
-			if (flags & hasNonOptionalChainParent) != 0 {
+			if (flags & (isNewTarget | hasNonOptionalChainParent)) != 0 {
 				wrap = true
 				p.print("(")
 			}
-			flags &= ^hasNonOptionalChainParent
+			flags &= ^(isNewTarget | hasNonOptionalChainParent)
 		}
-		p.printExpr(e.Target, js_ast.LPostfix, (flags&(forbidCall|hasNonOptionalChainParent))|isPropertyAccessTarget)
+		p.printExpr(e.Target, js_ast.LPostfix, (flags&(isNewTarget|hasNonOptionalChainParent))|isPropertyAccessTarget)
 		if p.canPrintIdentifier(e.Name) {
 			if e.OptionalChain != js_ast.OptionalChainStart && p.needSpaceBeforeDot == len(p.js) {
 				// "1.toString" is a syntax error, so print "1 .toString" instead
@@ -2594,13 +2614,13 @@ func (p *printer) printExpr(expr js_ast.Expr, level js_ast.L, flags printExprFla
 				}
 			}
 		} else {
-			if (flags & hasNonOptionalChainParent) != 0 {
+			if (flags & (isNewTarget | hasNonOptionalChainParent)) != 0 {
 				p.print("(")
 				defer p.print(")")
 			}
-			flags &= ^hasNonOptionalChainParent
+			flags &= ^(isNewTarget | hasNonOptionalChainParent)
 		}
-		p.printExpr(e.Target, js_ast.LPostfix, (flags&(forbidCall|hasNonOptionalChainParent))|isPropertyAccessTarget)
+		p.printExpr(e.Target, js_ast.LPostfix, (flags&(isNewTarget|hasNonOptionalChainParent))|isPropertyAccessTarget)
 		if e.OptionalChain == js_ast.OptionalChainStart {
 			p.print("?.")
 		}
@@ -2693,7 +2713,7 @@ func (p *printer) printExpr(expr js_ast.Expr, level js_ast.L, flags printExprFla
 		}
 
 	case *js_ast.EArrow:
-		wrap := level >= js_ast.LAssign
+		wrap := e.IsParenthesized || level >= js_ast.LAssign
 
 		if wrap {
 			p.print("(")
@@ -2721,8 +2741,12 @@ func (p *printer) printExpr(expr js_ast.Expr, level js_ast.L, flags printExprFla
 		wasPrinted := false
 		if len(e.Body.Block.Stmts) == 1 && e.PreferExpr {
 			if s, ok := e.Body.Block.Stmts[0].Data.(*js_ast.SReturn); ok && s.ValueOrNil.Data != nil {
+				var nestedFlags printExprFlags
+				if (flags&forbidIn) != 0 && !wrap {
+					nestedFlags |= forbidIn
+				}
 				p.arrowExprStart = len(p.js)
-				p.printExprWithoutLeadingNewline(s.ValueOrNil, js_ast.LComma, flags&forbidIn)
+				p.printExprWithoutLeadingNewline(s.ValueOrNil, js_ast.LComma, nestedFlags)
 				wasPrinted = true
 			}
 		}
@@ -2735,7 +2759,7 @@ func (p *printer) printExpr(expr js_ast.Expr, level js_ast.L, flags printExprFla
 
 	case *js_ast.EFunction:
 		n := len(p.js)
-		wrap := p.stmtStart == n || p.exportDefaultStart == n ||
+		wrap := e.IsParenthesized || p.stmtStart == n || p.exportDefaultStart == n ||
 			((flags&isPropertyAccessTarget) != 0 && p.options.UnsupportedFeatures.Has(compat.FunctionOrClassPropertyAccess))
 		if wrap {
 			p.print("(")
@@ -2998,7 +3022,7 @@ func (p *printer) printExpr(expr js_ast.Expr, level js_ast.L, flags printExprFla
 				p.printExpr(e.TagOrNil, js_ast.LLowest, isCallTargetOrTemplateTag)
 				p.print(")")
 			} else {
-				p.printExpr(e.TagOrNil, js_ast.LPostfix, isCallTargetOrTemplateTag)
+				p.printExpr(e.TagOrNil, js_ast.LPostfix, isCallTargetOrTemplateTag|(flags&isNewTarget))
 			}
 		} else {
 			p.addSourceMapping(expr.Loc)
@@ -3057,7 +3081,7 @@ func (p *printer) printExpr(expr js_ast.Expr, level js_ast.L, flags printExprFla
 			break
 		}
 
-		wrap := level >= js_ast.LNew || (flags&forbidCall) != 0
+		wrap := level >= js_ast.LNew || (flags&isNewTarget) != 0
 		hasPureComment := !p.options.MinifyWhitespace
 
 		if hasPureComment && level >= js_ast.LPostfix {
@@ -3912,9 +3936,10 @@ func (p *printer) printPath(importRecordIndex uint32, importKind ast.ImportKind)
 	if p.options.NeedsMetafile {
 		external := ""
 		if (record.Flags & ast.ShouldNotBeExternalInMetafile) == 0 {
-			external = ",\n          \"external\": true"
+			external = p.options.MetafileFormat.MaybeRemoveWhitespace(",\n          \"external\": true")
 		}
-		p.jsonMetadataImports = append(p.jsonMetadataImports, fmt.Sprintf("\n        {\n          \"path\": %s,\n          \"kind\": %s%s\n        }",
+		p.jsonMetadataImports = append(p.jsonMetadataImports, fmt.Sprintf(
+			p.options.MetafileFormat.MaybeRemoveWhitespace("\n        {\n          \"path\": %s,\n          \"kind\": %s%s\n        }"),
 			helpers.QuoteForJSON(record.Path.Text, p.options.ASCIIOnly),
 			helpers.QuoteForJSON(importKind.StringForMetafile(), p.options.ASCIIOnly),
 			external))
@@ -4688,7 +4713,14 @@ func (p *printer) printStmt(stmt js_ast.Stmt, flags printStmtFlags) {
 		p.addSourceMapping(stmt.Loc)
 		p.printIndent()
 		p.printSpaceBeforeIdentifier()
-		p.print("import")
+		switch p.importRecords[s.ImportRecordIndex].Phase {
+		case ast.DeferPhase:
+			p.print("import defer")
+		case ast.SourcePhase:
+			p.print("import source")
+		default:
+			p.print("import")
+		}
 		p.printSpace()
 
 		if s.DefaultName != nil {
@@ -4911,6 +4943,7 @@ type Options struct {
 	SourceMap           config.SourceMap
 	AddSourceMappings   bool
 	NeedsMetafile       bool
+	MetafileFormat      config.MetafileFormat
 }
 
 type RequireOrImportMeta struct {

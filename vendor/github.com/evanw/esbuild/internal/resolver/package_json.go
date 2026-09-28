@@ -255,9 +255,9 @@ func (r resolverQuery) parsePackageJSON(inputPath string) *packageJSON {
 		r.debugLogs.addNote(fmt.Sprintf("Failed to read file %q: %s", packageJSONPath, originalError.Error()))
 	}
 	if err != nil {
-		r.log.AddError(nil, logger.Range{},
-			fmt.Sprintf("Cannot read file %q: %s",
-				PrettyPath(r.fs, logger.Path{Text: packageJSONPath, Namespace: "file"}), err.Error()))
+		prettyPaths := MakePrettyPaths(r.fs, logger.Path{Text: packageJSONPath, Namespace: "file"})
+		r.log.AddError(nil, logger.Range{}, fmt.Sprintf("Cannot read file %q: %s",
+			prettyPaths.Select(r.options.LogPathStyle), err.Error()))
 		return nil
 	}
 	if r.debugLogs != nil {
@@ -266,9 +266,9 @@ func (r resolverQuery) parsePackageJSON(inputPath string) *packageJSON {
 
 	keyPath := logger.Path{Text: packageJSONPath, Namespace: "file"}
 	jsonSource := logger.Source{
-		KeyPath:    keyPath,
-		PrettyPath: PrettyPath(r.fs, keyPath),
-		Contents:   contents,
+		KeyPath:     keyPath,
+		PrettyPaths: MakePrettyPaths(r.fs, keyPath),
+		Contents:    contents,
 	}
 	tracker := logger.MakeLineColumnTracker(&jsonSource)
 
@@ -760,7 +760,7 @@ func parseImportsExportsMap(source logger.Source, log logger.Log, json js_ast.Ex
 				if helpers.IsInsideNodeModules(source.KeyPath.Text) {
 					kind = logger.Debug
 				}
-				var conditions string
+				var conditions strings.Builder
 				conditionWord := "condition"
 				itComesWord := "it comes"
 				if len(deadCondition.ranges) > 1 {
@@ -769,12 +769,12 @@ func parseImportsExportsMap(source logger.Source, log logger.Log, json js_ast.Ex
 				}
 				for i, r := range deadCondition.ranges {
 					if i > 0 {
-						conditions += " and "
+						conditions.WriteString(" and ")
 					}
-					conditions += source.TextForRange(r)
+					conditions.WriteString(source.TextForRange(r))
 				}
 				log.AddIDWithNotes(logger.MsgID_PackageJSON_DeadCondition, kind, &tracker, deadCondition.ranges[0],
-					fmt.Sprintf("The %s %s here will never be used as %s after %s", conditionWord, conditions, itComesWord, deadCondition.reason),
+					fmt.Sprintf("The %s %s here will never be used as %s after %s", conditionWord, conditions.String(), itComesWord, deadCondition.reason),
 					deadCondition.notes)
 			}
 

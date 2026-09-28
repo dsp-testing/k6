@@ -42,7 +42,7 @@ type parser struct {
 	fnOnlyDataVisit            fnOnlyDataVisit
 	allocatedNames             []string
 	currentScope               *js_ast.Scope
-	scopesForCurrentPart       []*js_ast.Scope
+	currentPart                *js_ast.Part
 	symbols                    []ast.Symbol
 	astHelpers                 js_ast.HelperContext
 	tsUseCounts                []uint32
@@ -53,10 +53,6 @@ type parser struct {
 	exprComments               map[logger.Loc][]string
 	mangledProps               map[string]ast.Ref
 	reservedProps              map[string]bool
-	symbolUses                 map[ast.Ref]js_ast.SymbolUse
-	importSymbolPropertyUses   map[ast.Ref]map[string]js_ast.SymbolUse
-	symbolCallUses             map[ast.Ref]js_ast.SymbolCallUse
-	declaredSymbols            []js_ast.DeclaredSymbol
 	globPatternImports         []globPatternImport
 	runtimeImports             map[string]ast.LocRef
 	duplicateCaseChecker       duplicateCaseChecker
@@ -115,9 +111,8 @@ type parser struct {
 	enclosingNamespaceArgRef *ast.Ref
 
 	// Imports (both ES6 and CommonJS) are tracked at the top level
-	importRecords               []ast.ImportRecord
-	importRecordsForCurrentPart []uint32
-	exportStarImportRecords     []uint32
+	importRecords           []ast.ImportRecord
+	exportStarImportRecords []uint32
 
 	// These are for handling ES6 imports and exports
 	importItemsForNamespace map[ast.Ref]namespaceImportItems
@@ -252,6 +247,7 @@ type parser struct {
 	firstJSXElementLoc     logger.Loc
 
 	fnOrArrowDataVisit fnOrArrowDataVisit
+	singleStmtDepth    int
 
 	// ArrowFunction is a special case in the grammar. Although it appears to be
 	// a PrimaryExpression, it's actually an AssignmentExpression. This means if
@@ -382,7 +378,6 @@ type parser struct {
 	shouldFoldTypeScriptConstantExpressions bool
 
 	allowIn                     bool
-	allowPrivateIdentifiers     bool
 	hasTopLevelReturn           bool
 	latestReturnHadSemicolon    bool
 	messageAboutThisIsUndefined bool
@@ -400,6 +395,7 @@ type globPatternImport struct {
 	approximateRange logger.Range
 	ref              ast.Ref
 	kind             ast.ImportKind
+	phase            ast.ImportPhase
 }
 
 type namespaceImportItems struct {
@@ -477,6 +473,8 @@ type optionsThatSupportStructuralEquality struct {
 	mode                   config.Mode
 	platform               config.Platform
 	outputFormat           config.Format
+	logPathStyle           logger.PathStyle
+	codePathStyle          logger.PathStyle
 	asciiOnly              bool
 	keepNames              bool
 	minifySyntax           bool
@@ -532,6 +530,8 @@ func OptionsFromConfig(options *config.Options) Options {
 			treeShaking:                       options.TreeShaking,
 			dropDebugger:                      options.DropDebugger,
 			mangleQuoted:                      options.MangleQuoted,
+			logPathStyle:                      options.LogPathStyle,
+			codePathStyle:                     options.CodePathStyle,
 		},
 	}
 }
@@ -737,6 +737,9 @@ type fnOnlyDataVisit struct {
 	// has been shadowed and is now inaccessible.
 	isThisNested bool
 
+	// If true, "this" is used in current function scope.
+	hasThisUsage bool
+
 	// Do not warn about "this" being undefined for code that the TypeScript
 	// compiler generates that looks like this:
 	//
@@ -790,30 +793,20 @@ func analyzeSwitchCasesForLiveness(s *js_ast.SSwitch) []switchCaseLiveness {
 			maxStatus = status
 		}
 
-		// Check for potential fall-through by checking for a jump at the end of the body
-		canFallThrough := true
-		stmts := c.Body
-		for len(stmts) > 0 {
-			switch s := stmts[len(stmts)-1].Data.(type) {
-			case *js_ast.SBlock:
-				stmts = s.Stmts // If this ends with a block, check the block's body next
-				continue
-			case *js_ast.SBreak, *js_ast.SContinue, *js_ast.SReturn, *js_ast.SThrow:
-				canFallThrough = false
-			}
-			break
-		}
-
 		cases = append(cases, switchCaseLiveness{
 			status:         status,
-			canFallThrough: canFallThrough,
+			canFallThrough: caseBodyCouldHaveFallThrough(c.Body),
 		})
 	}
 
 	// Set the liveness for the default case last based on the other cases
 	if defaultIndex != -1 {
 		// The negation here transposes "always live" with "always dead"
-		cases[defaultIndex].status = -maxStatus
+		status := -maxStatus
+		if maxStatus < status {
+			maxStatus = status
+		}
+		cases[defaultIndex].status = status
 	}
 
 	// Then propagate fall-through information in linear fall-through order
@@ -825,9 +818,40 @@ func analyzeSwitchCasesForLiveness(s *js_ast.SSwitch) []switchCaseLiveness {
 			for j := i + 1; j < len(cases) && cases[j-1].canFallThrough; j++ {
 				cases[j].status = livenessUnknown
 			}
+		} else if maxStatus > alwaysDead && stmtsCareAboutScope(s.Cases[i].Body) {
+			// Since adjacent cases share a scope, dead cases can potentially still
+			// affect other cases that are live. Consider the following:
+			//
+			//   globalThis.foo = true
+			//   switch (1) {
+			//     case 0:
+			//       let foo
+			//     case 1:
+			//       return foo
+			//   }
+			//
+			// This code is supposed to throw a ReferenceError. But if we treat the
+			// first case as dead code, then "let foo" will end up being removed and
+			// the code will incorrectly return true instead.
+			cases[i].status = livenessUnknown
 		}
 	}
 	return cases
+}
+
+// Check for potential fall-through by checking for a jump at the end of the body
+func caseBodyCouldHaveFallThrough(stmts []js_ast.Stmt) bool {
+	for len(stmts) > 0 {
+		switch s := stmts[len(stmts)-1].Data.(type) {
+		case *js_ast.SBlock:
+			stmts = s.Stmts // If this ends with a block, check the block's body next
+			continue
+		case *js_ast.SBreak, *js_ast.SContinue, *js_ast.SReturn, *js_ast.SThrow:
+			return false
+		}
+		break
+	}
+	return true
 }
 
 const bloomFilterSize = 251
@@ -1119,6 +1143,11 @@ func jumpStmtsLookTheSame(left js_ast.S, right js_ast.S) bool {
 }
 
 func (p *parser) selectLocalKind(kind js_ast.LocalKind) js_ast.LocalKind {
+	// Use "var" instead of "let" and "const" if they aren't supported
+	if (kind == js_ast.LocalLet || kind == js_ast.LocalConst) && p.options.unsupportedJSFeatures.Has(compat.ConstAndLet) {
+		return js_ast.LocalVar
+	}
+
 	// Use "var" instead of "let" and "const" if the variable declaration may
 	// need to be separated from the initializer. This allows us to safely move
 	// this declaration into a nested scope.
@@ -1489,7 +1518,6 @@ func (p *parser) declareSymbol(kind ast.SymbolKind, loc logger.Loc, name string)
 	// Overwrite this name in the declaring scope
 	p.currentScope.Members[name] = js_ast.ScopeMember{Ref: ref, Loc: loc}
 	return ref
-
 }
 
 // This type is just so we can use Go's native sort function
@@ -1702,9 +1730,11 @@ func (p *parser) recordUsage(ref ast.Ref) {
 	// code regions since those will be culled.
 	if !p.isControlFlowDead {
 		p.symbols[ref.InnerIndex].UseCountEstimate++
-		use := p.symbolUses[ref]
-		use.CountEstimate++
-		p.symbolUses[ref] = use
+		if part := p.currentPart; part != nil {
+			use := part.SymbolUses[ref]
+			use.CountEstimate++
+			part.SymbolUses[ref] = use
+		}
 	}
 
 	// The correctness of TypeScript-to-JavaScript conversion relies on accurate
@@ -1719,12 +1749,16 @@ func (p *parser) ignoreUsage(ref ast.Ref) {
 	// Roll back the use count increment in recordUsage()
 	if !p.isControlFlowDead {
 		p.symbols[ref.InnerIndex].UseCountEstimate--
-		use := p.symbolUses[ref]
-		use.CountEstimate--
-		if use.CountEstimate == 0 {
-			delete(p.symbolUses, ref)
-		} else {
-			p.symbolUses[ref] = use
+
+		// Only remove this usage if we're currently processing a part
+		if part := p.currentPart; part != nil {
+			use := part.SymbolUses[ref]
+			use.CountEstimate--
+			if use.CountEstimate == 0 {
+				delete(part.SymbolUses, ref)
+			} else {
+				part.SymbolUses[ref] = use
+			}
 		}
 	}
 
@@ -3110,8 +3144,9 @@ func (p *parser) parseFnExpr(loc logger.Loc, isAsync bool, asyncRange logger.Ran
 }
 
 type parenExprOpts struct {
-	asyncRange   logger.Range
-	forceArrowFn bool
+	asyncRange                    logger.Range
+	forceArrowFn                  bool
+	isAfterQuestionAndBeforeColon bool
 }
 
 // This assumes that the open parenthesis has already been parsed by the caller
@@ -3200,7 +3235,8 @@ func (p *parser) parseParenExpr(loc logger.Loc, level js_ast.L, opts parenExprOp
 	p.fnOrArrowDataParse = oldFnOrArrowData
 
 	// Are these arguments to an arrow function?
-	if p.lexer.Token == js_lexer.TEqualsGreaterThan || opts.forceArrowFn || (p.options.ts.Parse && p.lexer.Token == js_lexer.TColon) {
+	isArrowFn := p.lexer.Token == js_lexer.TEqualsGreaterThan
+	if isArrowFn || opts.forceArrowFn || (p.options.ts.Parse && p.lexer.Token == js_lexer.TColon) {
 		// Arrow functions are not allowed inside certain expressions
 		if level > js_ast.LAssign {
 			p.lexer.Unexpected()
@@ -3225,13 +3261,34 @@ func (p *parser) parseParenExpr(loc logger.Loc, level js_ast.L, opts parenExprOp
 			args = append(args, js_ast.Arg{Binding: binding, DefaultOrNil: initializerOrNil})
 		}
 
+		await := allowIdent
+		if isAsync {
+			await = allowExpr
+		}
+
 		// Avoid parsing TypeScript code like "a ? (1 + 2) : (3 + 4)" as an arrow
 		// function. The ":" after the ")" may be a return type annotation, so we
 		// attempt to convert the expressions to bindings first before deciding
 		// whether this is an arrow function, and only pick an arrow function if
 		// there were no conversion errors.
-		if p.lexer.Token == js_lexer.TEqualsGreaterThan || (len(invalidLog.invalidTokens) == 0 &&
-			p.trySkipTypeScriptArrowReturnTypeWithBacktracking()) || opts.forceArrowFn {
+		if p.options.ts.Parse && p.lexer.Token == js_lexer.TColon && len(invalidLog.invalidTokens) == 0 {
+			if opts.isAfterQuestionAndBeforeColon {
+				// Only do this very expensive check if we must
+				isArrowFn = p.isTypeScriptArrowReturnTypeAfterQuestionAndBeforeColon(await)
+				if isArrowFn {
+					// We know this will succeed because we've already done it once above
+					p.lexer.Next()
+					p.skipTypeScriptReturnType()
+				}
+			} else {
+				// Otherwise, do the less expensive check
+				isArrowFn = p.trySkipTypeScriptArrowReturnTypeWithBacktracking()
+			}
+		}
+
+		// Arrow function parsing may be forced if this parenthesized expression
+		// was prefixed by a TypeScript type parameter list such as "<T,>()"
+		if isArrowFn || opts.forceArrowFn {
 			if commaAfterSpread.Start != 0 {
 				p.log.AddError(&p.tracker, logger.Range{Loc: commaAfterSpread, Len: 1}, "Unexpected \",\" after rest pattern")
 			}
@@ -3250,11 +3307,6 @@ func (p *parser) parseParenExpr(loc logger.Loc, level js_ast.L, opts parenExprOp
 			// Also report syntax features used in bindings
 			for _, entry := range invalidLog.syntaxFeatures {
 				p.markSyntaxFeature(entry.feature, entry.token)
-			}
-
-			await := allowIdent
-			if isAsync {
-				await = allowExpr
 			}
 
 			arrow := p.parseArrowBody(args, fnOrArrowDataParse{
@@ -3440,6 +3492,8 @@ const (
 	exprFlagDecorator exprFlag = 1 << iota
 	exprFlagForLoopInit
 	exprFlagForAwaitLoopInit
+	exprFlagAfterQuestionAndBeforeColon
+	exprFlagIsNewTarget
 )
 
 func (p *parser) parsePrefix(level js_ast.L, errors *deferredErrors, flags exprFlag) js_ast.Expr {
@@ -3479,14 +3533,21 @@ func (p *parser) parsePrefix(level js_ast.L, errors *deferredErrors, flags exprF
 			p.allowIn = true
 
 			value := p.parseExpr(js_ast.LLowest)
-			p.markExprAsParenthesized(value, loc, false)
+
+			// Don't consider the "@(...)" decorator syntax to be important parentheses to preserve
+			if (flags & exprFlagDecorator) == 0 {
+				p.markExprAsParenthesized(value, loc, false)
+			}
+
 			p.lexer.Expect(js_lexer.TCloseParen)
 
 			p.allowIn = oldAllowIn
 			return value
 		}
 
-		value := p.parseParenExpr(loc, level, parenExprOpts{})
+		value := p.parseParenExpr(loc, level, parenExprOpts{
+			isAfterQuestionAndBeforeColon: (flags & exprFlagAfterQuestionAndBeforeColon) != 0,
+		})
 		return value
 
 	case js_lexer.TFalse:
@@ -3509,7 +3570,7 @@ func (p *parser) parsePrefix(level js_ast.L, errors *deferredErrors, flags exprF
 		return js_ast.Expr{Loc: loc, Data: js_ast.EThisShared}
 
 	case js_lexer.TPrivateIdentifier:
-		if !p.allowPrivateIdentifiers || !p.allowIn || level >= js_ast.LCompare {
+		if !p.allowIn || level >= js_ast.LCompare {
 			p.lexer.Unexpected()
 		}
 
@@ -3764,7 +3825,7 @@ func (p *parser) parsePrefix(level js_ast.L, errors *deferredErrors, flags exprF
 			return js_ast.Expr{Loc: loc, Data: &js_ast.ENewTarget{Range: r}}
 		}
 
-		target := p.parseExprWithFlags(js_ast.LMember, flags)
+		target := p.parseExprWithFlags(js_ast.LMember, flags|exprFlagIsNewTarget)
 		args := []js_ast.Expr{}
 		var closeParenLoc logger.Loc
 		var isMultiLine bool
@@ -4095,14 +4156,24 @@ func (p *parser) willNeedBindingPattern() bool {
 // Note: The caller has already parsed the "import" keyword
 func (p *parser) parseImportExpr(loc logger.Loc, level js_ast.L) js_ast.Expr {
 	// Parse an "import.meta" expression
+	phase := ast.EvaluationPhase
 	if p.lexer.Token == js_lexer.TDot {
 		p.lexer.Next()
-		if !p.lexer.IsContextualKeyword("meta") {
-			p.lexer.ExpectedString("\"meta\"")
+		if p.lexer.IsContextualKeyword("meta") {
+			p.esmImportMeta = logger.Range{Loc: loc, Len: p.lexer.Range().End() - loc.Start}
+			p.lexer.Next()
+			return js_ast.Expr{Loc: loc, Data: &js_ast.EImportMeta{RangeLen: p.esmImportMeta.Len}}
+		} else if p.lexer.IsContextualKeyword("defer") {
+			p.markSyntaxFeature(compat.ImportDefer, p.lexer.Range())
+			phase = ast.DeferPhase
+			p.lexer.Next()
+		} else if p.lexer.IsContextualKeyword("source") {
+			p.markSyntaxFeature(compat.ImportSource, p.lexer.Range())
+			phase = ast.SourcePhase
+			p.lexer.Next()
+		} else {
+			p.lexer.Unexpected()
 		}
-		p.esmImportMeta = logger.Range{Loc: loc, Len: p.lexer.Range().End() - loc.Start}
-		p.lexer.Next()
-		return js_ast.Expr{Loc: loc, Data: &js_ast.EImportMeta{RangeLen: p.esmImportMeta.Len}}
 	}
 
 	if level > js_ast.LCall {
@@ -4142,6 +4213,7 @@ func (p *parser) parseImportExpr(loc logger.Loc, level js_ast.L) js_ast.Expr {
 		Expr:          value,
 		OptionsOrNil:  optionsOrNil,
 		CloseParenLoc: closeParenLoc,
+		Phase:         phase,
 	}}
 }
 
@@ -4191,6 +4263,7 @@ func (p *parser) parseExprCommon(level js_ast.L, errors *deferredErrors, flags e
 
 func (p *parser) parseSuffix(left js_ast.Expr, level js_ast.L, errors *deferredErrors, flags exprFlag) js_ast.Expr {
 	optionalChain := js_ast.OptionalChainNone
+	afterAsLoc := logger.Loc{Start: -1}
 
 	for {
 		if p.lexer.Loc() == p.afterArrowBodyLoc {
@@ -4210,9 +4283,11 @@ func (p *parser) parseSuffix(left js_ast.Expr, level js_ast.L, errors *deferredE
 		}
 
 		// Stop now if this token is forbidden to follow a TypeScript "as" cast
-		if p.lexer.Loc() == p.forbidSuffixAfterAsLoc {
+		operatorRange := p.lexer.Range()
+		if operatorRange.Loc == p.forbidSuffixAfterAsLoc {
 			return left
 		}
+		isAfterAs := operatorRange.Loc == afterAsLoc
 
 		// Reset the optional chain flag by default. That way we won't accidentally
 		// treat "c.d" as OptionalChainContinue in "a?.b + c.d".
@@ -4223,7 +4298,7 @@ func (p *parser) parseSuffix(left js_ast.Expr, level js_ast.L, errors *deferredE
 		case js_lexer.TDot:
 			p.lexer.Next()
 
-			if p.lexer.Token == js_lexer.TPrivateIdentifier && p.allowPrivateIdentifiers {
+			if p.lexer.Token == js_lexer.TPrivateIdentifier {
 				// "a.#b"
 				// "a?.b.#c"
 				if _, ok := left.Data.(*js_ast.ESuper); ok {
@@ -4254,6 +4329,11 @@ func (p *parser) parseSuffix(left js_ast.Expr, level js_ast.L, errors *deferredE
 			optionalChain = oldOptionalChain
 
 		case js_lexer.TQuestionDot:
+			if (flags & exprFlagIsNewTarget) != 0 {
+				p.log.AddError(&p.tracker, p.lexer.Range(), "Cannot use an unparenthesized optional chain inside the target of \"new\"")
+				flags &= ^exprFlagIsNewTarget // Don't report this error more than once in this spot
+			}
+
 			p.lexer.Next()
 			optionalStart := js_ast.OptionalChainStart
 
@@ -4333,7 +4413,7 @@ func (p *parser) parseSuffix(left js_ast.Expr, level js_ast.L, errors *deferredE
 				}}
 
 			default:
-				if p.lexer.Token == js_lexer.TPrivateIdentifier && p.allowPrivateIdentifiers {
+				if p.lexer.Token == js_lexer.TPrivateIdentifier {
 					// "a?.#b"
 					name := p.lexer.Identifier
 					nameLoc := p.lexer.Loc()
@@ -4468,12 +4548,12 @@ func (p *parser) parseSuffix(left js_ast.Expr, level js_ast.L, errors *deferredE
 			oldAllowIn := p.allowIn
 			p.allowIn = true
 
-			yes := p.parseExpr(js_ast.LComma)
+			yes := p.parseExprWithFlags(js_ast.LComma, exprFlagAfterQuestionAndBeforeColon)
 
 			p.allowIn = oldAllowIn
 
 			p.lexer.Expect(js_lexer.TColon)
-			no := p.parseExpr(js_ast.LComma)
+			no := p.parseExprWithFlags(js_ast.LComma, flags&exprFlagAfterQuestionAndBeforeColon)
 			left = js_ast.Expr{Loc: left.Loc, Data: &js_ast.EIf{Test: left, Yes: yes, No: no}}
 
 		case js_lexer.TExclamation:
@@ -4900,10 +4980,38 @@ func (p *parser) parseSuffix(left js_ast.Expr, level js_ast.L, errors *deferredE
 					p.forbidSuffixAfterAsLoc = p.lexer.Loc()
 					return left
 				}
+				afterAsLoc = p.lexer.Loc()
 				continue
 			}
 
 			return left
+		}
+
+		// See: https://github.com/microsoft/TypeScript/issues/63527
+		if isAfterAs {
+			if binary, ok := left.Data.(*js_ast.EBinary); ok {
+				if binaryLeft, ok := binary.Left.Data.(*js_ast.EBinary); ok && !binaryLeft.IsParenthesized {
+					rightLevel := js_ast.OpTable[binary.Op].Level
+					if binary.Op.IsRightAssociative() {
+						rightLevel++
+					}
+					if rightLevel > js_ast.OpTable[binaryLeft.Op].Level {
+						start := binary.Left.Loc
+						end := p.source.LocBeforeWhitespace(operatorRange.Loc)
+						wrapRange := logger.Range{Loc: start, Len: end.Start - start.Start}
+						note := logger.MsgData{Text: "This is a syntax error in newer versions of TypeScript because the type cast has unintuitive precedence in this case."}
+						if text := p.source.TextForRange(wrapRange); !strings.ContainsRune(text, '\n') {
+							note = p.tracker.MsgData(wrapRange, note.Text+" Surround the inner expression in parentheses to silence this warning:")
+							note.Location.Suggestion = textForParenthesesSuggestion(text)
+						}
+						p.log.AddIDWithNotes(logger.MsgID_JS_ConfusingTypeScriptCast, logger.Warning, &p.tracker, operatorRange,
+							fmt.Sprintf("Operator %q should not directly follow a TypeScript type cast after the %q operator",
+								js_ast.OpTable[binary.Op].Text, js_ast.OpTable[binaryLeft.Op].Text),
+							[]logger.MsgData{note},
+						)
+					}
+				}
+			}
 		}
 	}
 }
@@ -4958,7 +5066,9 @@ func (p *parser) parseExprOrLetOrUsingStmt(opts parseStmtOpts) (js_ast.Expr, js_
 		}
 	} else if couldBeUsing && p.lexer.Token == js_lexer.TIdentifier && !p.lexer.HasNewlineBefore && (!opts.isForLoopInit || p.lexer.Raw() != "of") {
 		// Handle a "using" declaration
-		if opts.lexicalDecl != lexicalDeclAllowAll {
+		if opts.isCaseBody {
+			p.forbidUsingInSwitch(tokenRange.Loc)
+		} else if opts.lexicalDecl != lexicalDeclAllowAll {
 			p.forbidLexicalDecl(tokenRange.Loc)
 		}
 		opts.isUsingStmt = true
@@ -4983,7 +5093,9 @@ func (p *parser) parseExprOrLetOrUsingStmt(opts parseStmtOpts) (js_ast.Expr, js_
 			p.lexer.Next()
 			if p.lexer.Token == js_lexer.TIdentifier && !p.lexer.HasNewlineBefore {
 				// It's an "await using" declaration if we get here
-				if opts.lexicalDecl != lexicalDeclAllowAll {
+				if opts.isCaseBody {
+					p.forbidUsingInSwitch(usingRange.Loc)
+				} else if opts.lexicalDecl != lexicalDeclAllowAll {
 					p.forbidLexicalDecl(usingRange.Loc)
 				}
 				opts.isUsingStmt = true
@@ -5112,7 +5224,8 @@ func (p *parser) parseJSXTag() (logger.Range, string, js_ast.Expr) {
 	tag := js_ast.Expr{Loc: loc, Data: &js_ast.EIdentifier{Ref: p.storeNameInRef(tagName)}}
 
 	// Parse a member expression chain
-	chain := tagName.String
+	var chain strings.Builder
+	chain.WriteString(tagName.String)
 	for p.lexer.Token == js_lexer.TDot {
 		p.lexer.NextInsideJSXElement()
 		memberRange := p.lexer.Range()
@@ -5127,12 +5240,12 @@ func (p *parser) parseJSXTag() (logger.Range, string, js_ast.Expr) {
 			panic(js_lexer.LexerPanic{})
 		}
 
-		chain += "." + member.String
+		chain.WriteString("." + member.String)
 		tag = js_ast.Expr{Loc: loc, Data: p.dotOrMangledPropParse(tag, member, memberRange.Loc, js_ast.OptionalChainNone, wasOriginallyDot)}
 		tagRange.Len = memberRange.Loc.Start + memberRange.Len - tagRange.Loc.Start
 	}
 
-	return tagRange, chain, tag
+	return tagRange, chain.String(), tag
 }
 
 func (p *parser) parseJSXElement(loc logger.Loc) js_ast.Expr {
@@ -6410,9 +6523,7 @@ func (p *parser) parseClass(classKeyword logger.Range, name *ast.LocRef, classOp
 
 	// Allow "in" and private fields inside class bodies
 	oldAllowIn := p.allowIn
-	oldAllowPrivateIdentifiers := p.allowPrivateIdentifiers
 	p.allowIn = true
-	p.allowPrivateIdentifiers = true
 
 	// A scope is needed for private identifiers
 	scopeIndex := p.pushScopeForParsePass(js_ast.ScopeClassBody, bodyLoc)
@@ -6472,7 +6583,6 @@ func (p *parser) parseClass(classKeyword logger.Range, name *ast.LocRef, classOp
 	}
 
 	p.allowIn = oldAllowIn
-	p.allowPrivateIdentifiers = oldAllowPrivateIdentifiers
 
 	closeBraceLoc := p.saveExprCommentsHere()
 	p.lexer.Expect(js_lexer.TCloseBrace)
@@ -6941,7 +7051,7 @@ loop:
 		var notes []logger.MsgData
 		if text := p.source.TextForRange(wrapRange); !strings.ContainsRune(text, '\n') {
 			note := p.tracker.MsgData(wrapRange, "Wrap this decorator in parentheses to allow arbitrary expressions:")
-			note.Location.Suggestion = fmt.Sprintf("(%s)", text)
+			note.Location.Suggestion = textForParenthesesSuggestion(text)
 			notes = []logger.MsgData{note}
 		}
 		p.log.AddMsg(logger.Msg{
@@ -6952,6 +7062,14 @@ loop:
 	}
 
 	return memberExpr
+}
+
+func textForParenthesesSuggestion(text string) string {
+	count := utf8.RuneCountInString(text) - 2
+	if count < 1 {
+		count = 1
+	}
+	return fmt.Sprintf("(%s)", strings.Repeat(" ", count))
 }
 
 type lexicalDecl uint8
@@ -6977,6 +7095,7 @@ type parseStmtOpts struct {
 	allowDirectivePrologue  bool
 	hasNoSideEffectsComment bool
 	isUsingStmt             bool
+	isCaseBody              bool
 }
 
 func (p *parser) parseStmt(opts parseStmtOpts) js_ast.Stmt {
@@ -7244,7 +7363,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) js_ast.Stmt {
 				name := js_ast.GenerateNonUniqueNameFromPath(pathText) + "_star"
 				namespaceRef = p.storeNameInRef(js_lexer.MaybeSubstring{String: name})
 			}
-			importRecordIndex := p.addImportRecord(ast.ImportStmt, pathRange, pathText, assertOrWith, flags)
+			importRecordIndex := p.addImportRecord(ast.ImportStmt, ast.EvaluationPhase, pathRange, pathText, assertOrWith, flags)
 
 			// Export-star statements anywhere in the file disable top-level const
 			// local prefix because import cycles can be used to trigger TDZ
@@ -7267,7 +7386,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) js_ast.Stmt {
 				// "export {} from 'path'"
 				p.lexer.Next()
 				pathLoc, pathText, assertOrWith, flags := p.parsePath()
-				importRecordIndex := p.addImportRecord(ast.ImportStmt, pathLoc, pathText, assertOrWith, flags)
+				importRecordIndex := p.addImportRecord(ast.ImportStmt, ast.EvaluationPhase, pathLoc, pathText, assertOrWith, flags)
 				name := "import_" + js_ast.GenerateNonUniqueNameFromPath(pathText)
 				namespaceRef := p.storeNameInRef(js_lexer.MaybeSubstring{String: name})
 
@@ -7528,7 +7647,10 @@ func (p *parser) parseStmt(opts parseStmtOpts) js_ast.Stmt {
 					break caseBody
 
 				default:
-					body = append(body, p.parseStmt(parseStmtOpts{lexicalDecl: lexicalDeclAllowAll}))
+					body = append(body, p.parseStmt(parseStmtOpts{
+						lexicalDecl: lexicalDeclAllowAll,
+						isCaseBody:  true,
+					}))
 				}
 			}
 
@@ -7815,6 +7937,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) js_ast.Stmt {
 		p.esmImportStatementKeyword = p.lexer.Range()
 		p.lexer.Next()
 		stmt := js_ast.SImport{}
+		phase := ast.EvaluationPhase
 		wasOriginallyBareImport := false
 
 		// "export import foo = bar"
@@ -7878,8 +8001,53 @@ func (p *parser) parseStmt(opts parseStmtOpts) js_ast.Stmt {
 			}
 
 			defaultName := p.lexer.Identifier
-			stmt.DefaultName = &ast.LocRef{Loc: p.lexer.Loc(), Ref: p.storeNameInRef(defaultName)}
+			defaultLoc := p.lexer.Loc()
+			isDeferName := p.lexer.Raw() == "defer"
+			isSourceName := p.lexer.Raw() == "source"
 			p.lexer.Next()
+
+			if isDeferName && p.lexer.Token == js_lexer.TAsterisk {
+				// "import defer * as foo from 'bar';"
+				p.markSyntaxFeature(compat.ImportDefer, js_lexer.RangeOfIdentifier(p.source, defaultLoc))
+				phase = ast.DeferPhase
+				p.lexer.Next()
+				p.lexer.ExpectContextualKeyword("as")
+				stmt.NamespaceRef = p.storeNameInRef(p.lexer.Identifier)
+				starLoc := p.lexer.Loc()
+				stmt.StarNameLoc = &starLoc
+				p.lexer.Expect(js_lexer.TIdentifier)
+				p.lexer.ExpectContextualKeyword("from")
+				break
+			}
+
+			if isSourceName && p.lexer.Token == js_lexer.TIdentifier {
+				if p.lexer.Raw() == "from" {
+					nameSubstring := p.lexer.Identifier
+					nameLoc := p.lexer.Loc()
+					p.lexer.Next()
+					if p.lexer.IsContextualKeyword("from") {
+						// "import source from from 'foo';"
+						p.markSyntaxFeature(compat.ImportSource, js_lexer.RangeOfIdentifier(p.source, defaultLoc))
+						phase = ast.SourcePhase
+						stmt.DefaultName = &ast.LocRef{Loc: nameLoc, Ref: p.storeNameInRef(nameSubstring)}
+						p.lexer.Next()
+					} else {
+						// "import source from 'foo';"
+						stmt.DefaultName = &ast.LocRef{Loc: defaultLoc, Ref: p.storeNameInRef(defaultName)}
+					}
+					break
+				}
+
+				// "import source foo from 'bar';"
+				p.markSyntaxFeature(compat.ImportSource, js_lexer.RangeOfIdentifier(p.source, defaultLoc))
+				phase = ast.SourcePhase
+				stmt.DefaultName = &ast.LocRef{Loc: p.lexer.Loc(), Ref: p.storeNameInRef(p.lexer.Identifier)}
+				p.lexer.Next()
+				p.lexer.ExpectContextualKeyword("from")
+				break
+			}
+
+			stmt.DefaultName = &ast.LocRef{Loc: defaultLoc, Ref: p.storeNameInRef(defaultName)}
 
 			if p.options.ts.Parse {
 				// Skip over type-only imports
@@ -7994,7 +8162,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) js_ast.Stmt {
 		if wasOriginallyBareImport {
 			flags |= ast.WasOriginallyBareImport
 		}
-		stmt.ImportRecordIndex = p.addImportRecord(ast.ImportStmt, pathLoc, pathText, assertOrWith, flags)
+		stmt.ImportRecordIndex = p.addImportRecord(ast.ImportStmt, phase, pathLoc, pathText, assertOrWith, flags)
 
 		if stmt.StarNameLoc != nil {
 			name := p.loadNameFromRef(stmt.NamespaceRef)
@@ -8279,13 +8447,21 @@ func (p *parser) parseStmt(opts parseStmtOpts) js_ast.Stmt {
 	}
 }
 
-func (p *parser) addImportRecord(kind ast.ImportKind, pathRange logger.Range, text string, assertOrWith *ast.ImportAssertOrWith, flags ast.ImportRecordFlags) uint32 {
+func (p *parser) addImportRecord(
+	kind ast.ImportKind,
+	phase ast.ImportPhase,
+	pathRange logger.Range,
+	text string,
+	assertOrWith *ast.ImportAssertOrWith,
+	flags ast.ImportRecordFlags,
+) uint32 {
 	index := uint32(len(p.importRecords))
 	p.importRecords = append(p.importRecords, ast.ImportRecord{
 		Kind:         kind,
 		Range:        pathRange,
 		Path:         logger.Path{Text: text},
 		AssertOrWith: assertOrWith,
+		Phase:        phase,
 		Flags:        flags,
 	})
 	return index
@@ -8315,7 +8491,14 @@ func (p *parser) parseFnBody(data fnOrArrowDataParse) js_ast.FnBody {
 
 func (p *parser) forbidLexicalDecl(loc logger.Loc) {
 	r := js_lexer.RangeOfIdentifier(p.source, loc)
-	p.log.AddError(&p.tracker, r, "Cannot use a declaration in a single-statement context")
+	p.log.AddErrorWithNotes(&p.tracker, r, "Cannot use a declaration in a single-statement context",
+		[]logger.MsgData{{Text: "Wrap this declaration in a block statement to use it here."}})
+}
+
+func (p *parser) forbidUsingInSwitch(loc logger.Loc) {
+	r := js_lexer.RangeOfIdentifier(p.source, loc)
+	p.log.AddErrorWithNotes(&p.tracker, r, "Cannot use a \"using\" declaration directly inside a switch case",
+		[]logger.MsgData{{Text: "Wrap this declaration in a block statement to use it here."}})
 }
 
 func (p *parser) parseStmtsUpTo(end js_lexer.T, opts parseStmtOpts) []js_ast.Stmt {
@@ -8476,15 +8659,18 @@ func (p *parser) pushScopeForVisitPass(kind js_ast.ScopeKind, loc logger.Loc) {
 
 	// Sanity-check that the scopes generated by the first and second passes match
 	if order.loc != loc || order.scope.Kind != kind {
-		panic(fmt.Sprintf("Expected scope (%d, %d) in %s, found scope (%d, %d)",
+		panic(fmt.Sprintf("Expected scope (%d, %d) in %q, found scope (%d, %d)",
 			kind, loc.Start,
-			p.source.PrettyPath,
+			p.source.PrettyPaths.Select(p.options.logPathStyle),
 			order.scope.Kind, order.loc.Start))
 	}
 
 	p.scopesInOrder = p.scopesInOrder[1:]
 	p.currentScope = order.scope
-	p.scopesForCurrentPart = append(p.scopesForCurrentPart, order.scope)
+
+	if part := p.currentPart; part != nil {
+		part.Scopes = append(part.Scopes, order.scope)
+	}
 }
 
 type findSymbolResult struct {
@@ -8611,6 +8797,15 @@ func findIdentifiers(binding js_ast.Binding, identifiers []js_ast.Decl) []js_ast
 	return identifiers
 }
 
+func shouldKeepStmtsInDeadControlFlow(stmts []js_ast.Stmt) bool {
+	for _, child := range stmts {
+		if shouldKeepStmtInDeadControlFlow(child) {
+			return true
+		}
+	}
+	return false
+}
+
 // If this is in a dead branch, then we want to trim as much dead code as we
 // can. Everything can be trimmed except for hoisted declarations ("var" and
 // "function"), which affect the parent scope. For example:
@@ -8647,12 +8842,12 @@ func shouldKeepStmtInDeadControlFlow(stmt js_ast.Stmt) bool {
 		return true
 
 	case *js_ast.SBlock:
-		for _, child := range s.Stmts {
-			if shouldKeepStmtInDeadControlFlow(child) {
-				return true
-			}
-		}
-		return false
+		return shouldKeepStmtsInDeadControlFlow(s.Stmts)
+
+	case *js_ast.STry:
+		return shouldKeepStmtsInDeadControlFlow(s.Block.Stmts) ||
+			(s.Catch != nil && shouldKeepStmtsInDeadControlFlow(s.Catch.Block.Stmts)) ||
+			(s.Finally != nil && shouldKeepStmtsInDeadControlFlow(s.Finally.Block.Stmts))
 
 	case *js_ast.SIf:
 		return shouldKeepStmtInDeadControlFlow(s.Yes) || (s.NoOrNil.Data != nil && shouldKeepStmtInDeadControlFlow(s.NoOrNil))
@@ -8758,7 +8953,6 @@ type stmtsKind uint8
 
 const (
 	stmtsNormal stmtsKind = iota
-	stmtsSwitch
 	stmtsLoopBody
 	stmtsFnBody
 )
@@ -8922,7 +9116,7 @@ func (p *parser) visitStmts(stmts []js_ast.Stmt, kind stmtsKind) []js_ast.Stmt {
 	p.isControlFlowDead = oldIsControlFlowDead
 
 	// Lower using declarations
-	if kind != stmtsSwitch && p.shouldLowerUsingDeclarations(visited) {
+	if p.shouldLowerUsingDeclarations(visited) {
 		ctx := p.lowerUsingDeclarationContext()
 		ctx.scanStmts(p, visited)
 		visited = ctx.finalize(p, visited, p.currentScope.Parent == nil)
@@ -9039,7 +9233,7 @@ func (p *parser) mangleStmts(stmts []js_ast.Stmt, kind stmtsKind) []js_ast.Stmt 
 				// should have visited all the uses of "let" and "const" declarations
 				// by now since they are scoped to this block which we just finished
 				// visiting.
-				if prevS, ok := result[len(result)-1].Data.(*js_ast.SLocal); ok && prevS.Kind != js_ast.LocalVar {
+				if prevS, ok := result[len(result)-1].Data.(*js_ast.SLocal); ok && (prevS.Kind == js_ast.LocalLet || prevS.Kind == js_ast.LocalConst) {
 					last := prevS.Decls[len(prevS.Decls)-1]
 
 					// The binding must be an identifier that is only used once.
@@ -9100,6 +9294,12 @@ func (p *parser) mangleStmts(stmts []js_ast.Stmt, kind stmtsKind) []js_ast.Stmt 
 			}
 
 		case *js_ast.SExpr:
+			// Trim expressions without side effects
+			s.Value = p.astHelpers.SimplifyUnusedExpr(s.Value, p.options.unsupportedJSFeatures)
+			if s.Value.Data == nil {
+				continue
+			}
+
 			// Merge adjacent expression statements
 			if len(result) > 0 {
 				prevStmt := result[len(result)-1]
@@ -9172,7 +9372,7 @@ func (p *parser) mangleStmts(stmts []js_ast.Stmt, kind stmtsKind) []js_ast.Stmt 
 					body = append(body, stmts[i+1:]...)
 
 					// Don't do this transformation if the branch condition could
-					// potentially access symbols declared later on on this scope below.
+					// potentially access symbols declared later on this scope below.
 					// If so, inverting the branch condition and nesting statements after
 					// this in a block would break that access which is a behavior change.
 					//
@@ -9184,15 +9384,7 @@ func (p *parser) mangleStmts(stmts []js_ast.Stmt, kind stmtsKind) []js_ast.Stmt 
 					//   if (a(() => b)) return; let b;
 					//   if (a(() => b)) { let b; }
 					//
-					canMoveBranchConditionOutsideScope := true
-					for _, stmt := range body {
-						if statementCaresAboutScope(stmt) {
-							canMoveBranchConditionOutsideScope = false
-							break
-						}
-					}
-
-					if canMoveBranchConditionOutsideScope {
+					if !stmtsCareAboutScope(body) {
 						body = p.mangleStmts(body, kind)
 						bodyLoc := s.Yes.Loc
 						if len(body) > 0 {
@@ -9332,9 +9524,14 @@ func (p *parser) mangleStmts(stmts []js_ast.Stmt, kind stmtsKind) []js_ast.Stmt 
 			}
 
 		case stmtsFnBody:
-			// "function f() { x(); return; }" => "function f() { x(); }"
-			if returnS, ok := result[len(result)-1].Data.(*js_ast.SReturn); ok && returnS.ValueOrNil.Data == nil {
-				result = result[:len(result)-1]
+			if returnS, ok := result[len(result)-1].Data.(*js_ast.SReturn); ok {
+				if returnS.ValueOrNil.Data == nil {
+					// "function f() { x(); return; }" => "function f() { x(); }"
+					result = result[:len(result)-1]
+				} else if unary, ok := returnS.ValueOrNil.Data.(*js_ast.EUnary); ok && unary.Op == js_ast.UnOpVoid {
+					// "function f() { return void x(); }" => "function f() { x(); }"
+					result[len(result)-1].Data = &js_ast.SExpr{Value: unary.Value}
+				}
 			}
 		}
 	}
@@ -9695,6 +9892,12 @@ func (p *parser) substituteSingleUseSymbolInExpr(
 
 		if value, status := p.substituteSingleUseSymbolInExpr(e.Target, ref, replacement, replacementCanBeRemoved); status != substituteContinue {
 			e.Target = value
+			if status == substituteSuccess {
+				// "const y = () => x; y()" => "(() => x)()" => "x"
+				if value, ok := p.maybeInlineIIFE(expr.Loc, e); ok {
+					return value, substituteSuccess
+				}
+			}
 			return expr, status
 		}
 
@@ -9806,7 +10009,9 @@ func (p *parser) visitSingleStmt(stmt js_ast.Stmt, kind stmtsKind) js_ast.Stmt {
 		}
 	}
 
+	p.singleStmtDepth++
 	stmts := p.visitStmts([]js_ast.Stmt{stmt}, kind)
+	p.singleStmtDepth--
 
 	// Balance the fake block scope introduced above
 	if hasIfScope {
@@ -9821,7 +10026,7 @@ func stmtsToSingleStmt(loc logger.Loc, stmts []js_ast.Stmt, closeBraceLoc logger
 	if len(stmts) == 0 {
 		return js_ast.Stmt{Loc: loc, Data: js_ast.SEmptyShared}
 	}
-	if len(stmts) == 1 && !statementCaresAboutScope(stmts[0]) {
+	if len(stmts) == 1 && !stmtCaresAboutScope(stmts[0]) {
 		return stmts[0]
 	}
 	return js_ast.Stmt{Loc: loc, Data: &js_ast.SBlock{Stmts: stmts, CloseBraceLoc: closeBraceLoc}}
@@ -9856,9 +10061,18 @@ func (p *parser) visitForLoopInit(stmt js_ast.Stmt, isInOrOf bool) js_ast.Stmt {
 }
 
 func (p *parser) recordDeclaredSymbol(ref ast.Ref) {
-	p.declaredSymbols = append(p.declaredSymbols, js_ast.DeclaredSymbol{
+	isTopLevel := p.currentScope == p.moduleScope
+
+	// Check whether this symbol was hoisted out of a nested scope into the module scope
+	if !isTopLevel {
+		if symbol := p.symbols[ref.InnerIndex]; symbol.Kind.IsHoisted() && p.moduleScope.Members[symbol.OriginalName].Ref == ref {
+			isTopLevel = true
+		}
+	}
+
+	p.currentPart.DeclaredSymbols = append(p.currentPart.DeclaredSymbols, js_ast.DeclaredSymbol{
 		Ref:        ref,
-		IsTopLevel: p.currentScope == p.moduleScope,
+		IsTopLevel: isTopLevel,
 	})
 }
 
@@ -9925,7 +10139,7 @@ func (p *parser) visitBinding(binding js_ast.Binding, opts bindingOpts) {
 	}
 }
 
-func statementCaresAboutScope(stmt js_ast.Stmt) bool {
+func stmtCaresAboutScope(stmt js_ast.Stmt) bool {
 	switch s := stmt.Data.(type) {
 	case *js_ast.SBlock, *js_ast.SEmpty, *js_ast.SDebugger, *js_ast.SExpr, *js_ast.SIf,
 		*js_ast.SFor, *js_ast.SForIn, *js_ast.SForOf, *js_ast.SDoWhile, *js_ast.SWhile,
@@ -9941,11 +10155,20 @@ func statementCaresAboutScope(stmt js_ast.Stmt) bool {
 	}
 }
 
+func stmtsCareAboutScope(stmts []js_ast.Stmt) bool {
+	for _, stmt := range stmts {
+		if stmtCaresAboutScope(stmt) {
+			return true
+		}
+	}
+	return false
+}
+
 func dropFirstStatement(body js_ast.Stmt, replaceOrNil js_ast.Stmt) js_ast.Stmt {
 	if block, ok := body.Data.(*js_ast.SBlock); ok && len(block.Stmts) > 0 {
 		if replaceOrNil.Data != nil {
 			block.Stmts[0] = replaceOrNil
-		} else if len(block.Stmts) == 2 && !statementCaresAboutScope(block.Stmts[1]) {
+		} else if len(block.Stmts) == 2 && !stmtCaresAboutScope(block.Stmts[1]) {
 			return block.Stmts[1]
 		} else {
 			block.Stmts = block.Stmts[1:]
@@ -10011,23 +10234,12 @@ func mangleFor(s *js_ast.SFor) {
 }
 
 func appendIfOrLabelBodyPreservingScope(stmts []js_ast.Stmt, body js_ast.Stmt) []js_ast.Stmt {
-	if block, ok := body.Data.(*js_ast.SBlock); ok {
-		keepBlock := false
-		for _, stmt := range block.Stmts {
-			if statementCaresAboutScope(stmt) {
-				keepBlock = true
-				break
-			}
-		}
-		if !keepBlock {
-			return append(stmts, block.Stmts...)
-		}
+	if block, ok := body.Data.(*js_ast.SBlock); ok && !stmtsCareAboutScope(block.Stmts) {
+		return append(stmts, block.Stmts...)
 	}
-
-	if statementCaresAboutScope(body) {
+	if stmtCaresAboutScope(body) {
 		return append(stmts, js_ast.Stmt{Loc: body.Loc, Data: &js_ast.SBlock{Stmts: []js_ast.Stmt{body}}})
 	}
-
 	return append(stmts, body)
 }
 
@@ -10496,7 +10708,7 @@ func (p *parser) visitAndAppendStmt(stmts []js_ast.Stmt, stmt js_ast.Stmt) []js_
 
 		// Handle "for await" that has been lowered by moving this label inside the "try"
 		if try, ok := s.Stmt.Data.(*js_ast.STry); ok && len(try.Block.Stmts) == 1 {
-			if _, ok := try.Block.Stmts[0].Data.(*js_ast.SFor); ok {
+			if loop, ok := try.Block.Stmts[0].Data.(*js_ast.SFor); ok && loop.IsLoweredForAwait {
 				try.Block.Stmts[0] = js_ast.Stmt{Loc: stmt.Loc, Data: &js_ast.SLabel{
 					Stmt:             try.Block.Stmts[0],
 					Name:             s.Name,
@@ -10661,14 +10873,6 @@ func (p *parser) visitAndAppendStmt(stmts []js_ast.Stmt, stmt js_ast.Stmt) []js_
 			return stmts
 		}
 
-		// Trim expressions without side effects
-		if p.options.minifySyntax {
-			s.Value = p.astHelpers.SimplifyUnusedExpr(s.Value, p.options.unsupportedJSFeatures)
-			if s.Value.Data == nil {
-				return stmts
-			}
-		}
-
 	case *js_ast.SThrow:
 		s.Value = p.visitExpr(s.Value)
 
@@ -10712,7 +10916,7 @@ func (p *parser) visitAndAppendStmt(stmts []js_ast.Stmt, stmt js_ast.Stmt) []js_
 		p.popScope()
 
 		if p.options.minifySyntax {
-			if len(s.Stmts) == 1 && !statementCaresAboutScope(s.Stmts[0]) {
+			if len(s.Stmts) == 1 && !stmtCaresAboutScope(s.Stmts[0]) {
 				// Unwrap blocks containing a single statement
 				stmt = s.Stmts[0]
 			} else if len(s.Stmts) == 0 {
@@ -10976,41 +11180,48 @@ func (p *parser) visitAndAppendStmt(stmts []js_ast.Stmt, stmt js_ast.Stmt) []js_
 			p.popScope()
 		}
 
-		// Drop the whole thing if the try body is empty
-		if p.options.minifySyntax && len(s.Block.Stmts) == 0 {
-			keepCatch := false
+		if p.options.minifySyntax {
+			if len(s.Block.Stmts) == 0 {
+				// Try to drop the whole thing if the try body is empty
+				keepCatch := false
 
-			// Certain "catch" blocks need to be preserved:
-			//
-			//   try {} catch { let foo } // Can be removed
-			//   try {} catch { var foo } // Must be kept
-			//
-			if s.Catch != nil {
-				for _, stmt2 := range s.Catch.Block.Stmts {
-					if shouldKeepStmtInDeadControlFlow(stmt2) {
-						keepCatch = true
-						break
+				// Certain "catch" blocks need to be preserved:
+				//
+				//   try {} catch { let foo } // Can be removed
+				//   try {} catch { var foo } // Must be kept
+				//
+				if s.Catch != nil {
+					for _, stmt2 := range s.Catch.Block.Stmts {
+						if shouldKeepStmtInDeadControlFlow(stmt2) {
+							keepCatch = true
+							break
+						}
 					}
 				}
-			}
 
-			// Make sure to preserve the "finally" block if present
-			if !keepCatch {
-				if s.Finally == nil {
-					return stmts
-				}
-				finallyNeedsBlock := false
-				for _, stmt2 := range s.Finally.Block.Stmts {
-					if statementCaresAboutScope(stmt2) {
-						finallyNeedsBlock = true
-						break
+				// Make sure to preserve the "finally" block if present
+				if !keepCatch {
+					if s.Finally == nil {
+						return stmts
 					}
+					if !stmtsCareAboutScope(s.Finally.Block.Stmts) {
+						return append(stmts, s.Finally.Block.Stmts...)
+					}
+					block := s.Finally.Block
+					stmt = js_ast.Stmt{Loc: s.Finally.Loc, Data: &block}
 				}
-				if !finallyNeedsBlock {
-					return append(stmts, s.Finally.Block.Stmts...)
+			} else if s.Finally != nil && len(s.Finally.Block.Stmts) == 0 {
+				if s.Catch != nil {
+					// Just remove the "finally" block if there's a "catch"
+					s.Finally = nil
+				} else {
+					// Otherwise, try to unwrap the whole "try" statement
+					if !stmtsCareAboutScope(s.Block.Stmts) {
+						return append(stmts, s.Block.Stmts...)
+					}
+					block := s.Block
+					stmt = js_ast.Stmt{Loc: s.Finally.Loc, Data: &block}
 				}
-				block := s.Finally.Block
-				stmt = js_ast.Stmt{Loc: s.Finally.Loc, Data: &block}
 			}
 		}
 
@@ -11019,6 +11230,27 @@ func (p *parser) visitAndAppendStmt(stmts []js_ast.Stmt, stmt js_ast.Stmt) []js_
 		p.pushScopeForVisitPass(js_ast.ScopeBlock, s.BodyLoc)
 		oldIsInsideSwitch := p.fnOrArrowDataVisit.isInsideSwitch
 		p.fnOrArrowDataVisit.isInsideSwitch = true
+
+		// Disable const inlining in switch cases. They all share the same scope
+		// and can be evaluated in an unusual order. For example:
+		//
+		//   // This should not become "return 0"
+		//   switch (1) {
+		//     case 0:
+		//       const x = 0
+		//     case 1:
+		//       return x
+		//   }
+		//
+		//   // This should not become "return 0"
+		//   switch (0) {
+		//     case 0:
+		//       return x
+		//     case 1:
+		//       const x = 0
+		//   }
+		//
+		p.currentScope.IsAfterConstLocalPrefix = true
 
 		// Visit case values first
 		for i := range s.Cases {
@@ -11051,7 +11283,7 @@ func (p *parser) visitAndAppendStmt(stmts []js_ast.Stmt, stmt js_ast.Stmt) []js_
 			if isAlwaysDead {
 				p.isControlFlowDead = true
 			}
-			c.Body = p.visitStmts(c.Body, stmtsSwitch)
+			c.Body = p.visitStmts(c.Body, stmtsNormal)
 			p.isControlFlowDead = old
 
 			// Filter out this case when minifying if it's known to be dead. Visiting
@@ -11080,39 +11312,8 @@ func (p *parser) visitAndAppendStmt(stmts []js_ast.Stmt, stmt js_ast.Stmt) []js_
 			return stmts
 		}
 
-		// "using" declarations inside switch statements must be special-cased
-		if lowered := p.maybeLowerUsingDeclarationsInSwitch(stmt.Loc, s); lowered != nil {
-			return append(stmts, lowered...)
-		}
-
-		// Attempt to remove statically-determined switch statements
 		if p.options.minifySyntax {
-			if len(s.Cases) == 0 {
-				if p.astHelpers.ExprCanBeRemovedIfUnused(s.Test) {
-					// Remove everything
-					return stmts
-				} else {
-					// Just keep the test expression
-					return append(stmts, js_ast.Stmt{Loc: s.Test.Loc, Data: &js_ast.SExpr{Value: s.Test}})
-				}
-			} else if len(s.Cases) == 1 {
-				c := s.Cases[0]
-				var isTaken bool
-				var ok bool
-				if c.ValueOrNil.Data != nil {
-					// Non-default case
-					isTaken, ok = js_ast.CheckEqualityIfNoSideEffects(s.Test.Data, c.ValueOrNil.Data, js_ast.StrictEquality)
-				} else {
-					// Default case
-					isTaken, ok = true, p.astHelpers.ExprCanBeRemovedIfUnused(s.Test)
-				}
-				if ok && isTaken {
-					if body, ok := tryToInlineCaseBody(s.BodyLoc, c.Body, s.CloseBraceLoc); ok {
-						// Inline the case body
-						return append(stmts, body...)
-					}
-				}
-			}
+			return p.minifySwitchStmt(stmt.Loc, s, stmts)
 		}
 
 	case *js_ast.SFunction:
@@ -11408,6 +11609,140 @@ func (p *parser) visitAndAppendStmt(stmts []js_ast.Stmt, stmt js_ast.Stmt) []js_
 	return stmts
 }
 
+func (p *parser) minifySwitchStmt(loc logger.Loc, s *js_ast.SSwitch, stmts []js_ast.Stmt) []js_ast.Stmt {
+	// Trim empty cases before a trailing default clause
+	if len(s.Cases) > 0 {
+		if i := len(s.Cases) - 1; s.Cases[i].ValueOrNil.Data == nil {
+			// "switch (x) { case 0: default: y() }" => "switch (x) { default: y() }"
+			for i > 0 && len(s.Cases[i-1].Body) == 0 && js_ast.IsPrimitiveLiteral(s.Cases[i-1].ValueOrNil.Data) {
+				i--
+			}
+			s.Cases = append(s.Cases[:i], s.Cases[len(s.Cases)-1])
+		}
+	}
+
+	// Attempt to partially-evaluate statically-determined switch statements
+	if js_ast.IsPrimitiveLiteral(s.Test.Data) {
+		allCasesArePrimitives := true
+		defaultIndex := -1
+
+		// Pass 1: Check for primitives and find the "default" case
+		for i, c := range s.Cases {
+			if c.ValueOrNil.Data == nil {
+				defaultIndex = i
+			} else if !js_ast.IsPrimitiveLiteral(c.ValueOrNil.Data) {
+				allCasesArePrimitives = false
+			}
+		}
+
+		// To simplify analysis, only continue when all cases are primitives
+		if allCasesArePrimitives {
+			takenIndex := -1
+
+			// Find the case that compares equal and will be taken
+			for i, c := range s.Cases {
+				if isEqualToTest, ok := js_ast.CheckEqualityIfNoSideEffects(s.Test.Data, c.ValueOrNil.Data, js_ast.StrictEquality); ok && isEqualToTest {
+					takenIndex = i
+					break
+				}
+			}
+			if takenIndex == -1 {
+				takenIndex = defaultIndex
+			}
+
+			// Partially evaluate the cases
+			if takenIndex != -1 {
+				isFallThrough := false
+				liveIndex := -1
+				end := 0
+				for i, c := range s.Cases {
+					isTaken := i == takenIndex
+					if isTaken {
+						liveIndex = end
+					}
+					if isFallThrough {
+						live := &s.Cases[liveIndex]
+						live.Body = append(live.Body, c.Body...)
+					} else if isTaken || len(c.Body) > 0 {
+						s.Cases[end] = c
+						end++
+					}
+					if isTaken || isFallThrough {
+						isFallThrough = caseBodyCouldHaveFallThrough(c.Body)
+					}
+				}
+				s.Cases = s.Cases[:end]
+			}
+		}
+	}
+
+	// Handle empty switch statements
+	if len(s.Cases) == 0 {
+		if p.astHelpers.ExprCanBeRemovedIfUnused(s.Test) {
+			// Remove everything
+			return stmts
+		} else {
+			// Just keep the test expression
+			return append(stmts, js_ast.Stmt{Loc: s.Test.Loc, Data: &js_ast.SExpr{Value: s.Test}})
+		}
+	}
+
+	// Handle a switch statement containing only a "default" clause
+	if len(s.Cases) == 1 {
+		if c := s.Cases[0]; c.ValueOrNil.Data == nil && p.astHelpers.ExprCanBeRemovedIfUnused(s.Test) {
+			if body, ok := tryToInlineCaseBody(s.BodyLoc, c.Body, s.CloseBraceLoc); ok {
+				return append(stmts, body...)
+			}
+		}
+	}
+
+	// Try to turn this into an if-else statement
+	var yesCase js_ast.Case
+	var noCase js_ast.Case
+	if len(s.Cases) == 1 {
+		if yes := s.Cases[0]; yes.ValueOrNil.Data != nil {
+			yesCase = yes
+		}
+	} else if len(s.Cases) == 2 {
+		// "switch (x) { case y: a(); break; default: b() }"
+		if yes := s.Cases[0]; yes.ValueOrNil.Data != nil && !caseBodyCouldHaveFallThrough(yes.Body) {
+			if no := s.Cases[1]; no.ValueOrNil.Data == nil {
+				yesCase = yes
+				noCase = no
+			}
+		}
+
+		// "switch (x) { default: a(); break; case y: b() }"
+		if no := s.Cases[0]; no.ValueOrNil.Data == nil && !caseBodyCouldHaveFallThrough(no.Body) {
+			if yes := s.Cases[1]; yes.ValueOrNil.Data != nil {
+				yesCase = yes
+				noCase = no
+			}
+		}
+	}
+	if yesCase.ValueOrNil.Data != nil {
+		if yesBody, ok := tryToInlineCaseBody(s.BodyLoc, yesCase.Body, s.CloseBraceLoc); ok {
+			if noBody, ok := tryToInlineCaseBody(s.BodyLoc, noCase.Body, s.CloseBraceLoc); ok {
+				ifElse := js_ast.SIf{
+					Test: js_ast.Expr{Loc: s.Test.Loc},
+					Yes:  stmtsToSingleStmt(yesCase.Loc, yesBody, logger.Loc{}),
+				}
+				if isEqualToTest, ok := js_ast.CheckEqualityIfNoSideEffects(s.Test.Data, yesCase.ValueOrNil.Data, js_ast.StrictEquality); ok {
+					ifElse.Test.Data = &js_ast.EBoolean{Value: isEqualToTest}
+				} else {
+					ifElse.Test.Data = &js_ast.EBinary{Op: js_ast.BinOpStrictEq, Left: s.Test, Right: yesCase.ValueOrNil}
+				}
+				if len(noBody) > 0 {
+					ifElse.NoOrNil = stmtsToSingleStmt(noCase.Loc, noBody, logger.Loc{})
+				}
+				return p.mangleIf(stmts, loc, &ifElse)
+			}
+		}
+	}
+
+	return append(stmts, js_ast.Stmt{Loc: loc, Data: s})
+}
+
 func tryToInlineCaseBody(openBraceLoc logger.Loc, stmts []js_ast.Stmt, closeBraceLoc logger.Loc) ([]js_ast.Stmt, bool) {
 	if len(stmts) == 1 {
 		if block, ok := stmts[0].Data.(*js_ast.SBlock); ok {
@@ -11518,7 +11853,7 @@ const (
 // instead of having to traverse recursively into the statement tree.
 func (p *parser) maybeRelocateVarsToTopLevel(decls []js_ast.Decl, mode relocateVarsMode) (js_ast.Stmt, bool) {
 	// Only do this when bundling, and not when the scope is already top-level
-	if p.options.mode != config.ModeBundle || p.currentScope == p.moduleScope {
+	if p.options.mode != config.ModeBundle || (p.currentScope == p.moduleScope && p.singleStmtDepth == 0) {
 		return js_ast.Stmt{}, false
 	}
 
@@ -11571,6 +11906,12 @@ func (p *parser) markExprAsParenthesized(value js_ast.Expr, openParenLoc logger.
 		e.IsParenthesized = true
 	case *js_ast.EObject:
 		e.IsParenthesized = true
+	case *js_ast.EFunction:
+		e.IsParenthesized = true
+	case *js_ast.EArrow:
+		e.IsParenthesized = true
+	case *js_ast.EBinary:
+		e.IsParenthesized = true
 	}
 }
 
@@ -11581,6 +11922,62 @@ func (p *parser) maybeTransposeIfExprChain(expr js_ast.Expr, visit func(js_ast.E
 		return expr
 	}
 	return visit(expr)
+}
+
+func (p *parser) maybeInlineIIFE(loc logger.Loc, e *js_ast.ECall) (js_ast.Expr, bool) {
+	if len(e.Args) != 0 {
+		return js_ast.Expr{}, false
+	}
+
+	// Note: Do not inline async arrow functions as they are not IIFEs. In
+	// particular, they are not necessarily invoked immediately, and any
+	// exceptions involved in their evaluation will be swallowed without
+	// bubbling up to the surrounding context.
+	if arrow, ok := e.Target.Data.(*js_ast.EArrow); ok && len(arrow.Args) == 0 && !arrow.IsAsync {
+		stmts := arrow.Body.Block.Stmts
+
+		// "(() => {})()" => "void 0"
+		if len(stmts) == 0 {
+			return js_ast.Expr{Loc: loc, Data: js_ast.EUndefinedShared}, true
+		}
+
+		if len(stmts) == 1 {
+			var value js_ast.Expr
+
+			switch s := stmts[0].Data.(type) {
+			// "(() => { return })()" => "void 0"
+			// "(() => { return 123 })()" => "123"
+			case *js_ast.SReturn:
+				value = s.ValueOrNil
+				if value.Data == nil {
+					value.Data = js_ast.EUndefinedShared
+				}
+
+			// "(() => { x })()" => "void x"
+			case *js_ast.SExpr:
+				value = s.Value
+				value.Data = &js_ast.EUnary{Op: js_ast.UnOpVoid, Value: value}
+			}
+
+			if value.Data != nil {
+				// Be careful about "/* @__PURE__ */" comments:
+				//
+				//   OK:  "(() => x)()"                 => "x"
+				//   BAD: "/* @__PURE__ */ (() => x)()" => "x"
+				//
+				// The comment indicates that the function body is eligible for
+				// dead code elimination. Since we don't have a direct AST node
+				// for that, we can't currently unwrap that and preserve the
+				// intent. So if it does have a pure comment, only remove it if
+				// the value itself is already pure.
+				if !e.CanBeUnwrappedIfUnused || p.astHelpers.ExprCanBeRemovedIfUnused(value) {
+					return value, true
+				}
+			}
+		}
+	}
+
+	return js_ast.Expr{}, false
 }
 
 func (p *parser) iifeCanBeRemovedIfUnused(args []js_ast.Arg, body js_ast.FnBody) bool {
@@ -12401,7 +12798,8 @@ func (p *parser) instantiateInjectDotName(loc logger.Loc, name injectedDotName, 
 			p.log.AddErrorWithNotes(&p.tracker, r,
 				fmt.Sprintf("Cannot assign to %q because it's an import from an injected file", joined),
 				[]logger.MsgData{tracker.MsgData(js_lexer.RangeOfIdentifier(where.source, where.loc),
-					fmt.Sprintf("The symbol %q was exported from %q here:", joined, where.source.PrettyPath))})
+					fmt.Sprintf("The symbol %q was exported from %q here:",
+						joined, where.source.PrettyPaths.Select(p.options.logPathStyle)))})
 		}
 	}
 
@@ -12731,22 +13129,25 @@ func (p *parser) maybeRewritePropertyAccess(
 	if p.options.mode == config.ModeBundle && !p.isControlFlowDead {
 		if id, ok := target.Data.(*js_ast.EImportIdentifier); ok {
 			// Remove the normal symbol use
-			use := p.symbolUses[id.Ref]
+			symbolUses := p.currentPart.SymbolUses
+			use := symbolUses[id.Ref]
 			use.CountEstimate--
 			if use.CountEstimate == 0 {
-				delete(p.symbolUses, id.Ref)
+				delete(symbolUses, id.Ref)
 			} else {
-				p.symbolUses[id.Ref] = use
+				symbolUses[id.Ref] = use
 			}
 
 			// Add a special symbol use instead
-			if p.importSymbolPropertyUses == nil {
-				p.importSymbolPropertyUses = make(map[ast.Ref]map[string]js_ast.SymbolUse)
+			importSymbolPropertyUses := p.currentPart.ImportSymbolPropertyUses
+			if importSymbolPropertyUses == nil {
+				importSymbolPropertyUses = make(map[ast.Ref]map[string]js_ast.SymbolUse)
+				p.currentPart.ImportSymbolPropertyUses = importSymbolPropertyUses
 			}
-			properties := p.importSymbolPropertyUses[id.Ref]
+			properties := importSymbolPropertyUses[id.Ref]
 			if properties == nil {
 				properties = make(map[string]js_ast.SymbolUse)
-				p.importSymbolPropertyUses[id.Ref] = properties
+				importSymbolPropertyUses[id.Ref] = properties
 			}
 			use = properties[name]
 			use.CountEstimate++
@@ -13232,6 +13633,8 @@ func (p *parser) visitExprInOut(expr js_ast.Expr, in exprIn) (js_ast.Expr, exprO
 		isDeleteTarget := e == p.deleteTarget
 		isCallTarget := e == p.callTarget
 
+		p.fnOnlyDataVisit.hasThisUsage = true
+
 		if value, ok := p.valueForThis(expr.Loc, true /* shouldLog */, in.assignTarget, isDeleteTarget, isCallTarget); ok {
 			return value, exprOut{}
 		}
@@ -13349,7 +13752,8 @@ func (p *parser) visitExprInOut(expr js_ast.Expr, in exprIn) (js_ast.Expr, exprO
 					p.log.AddErrorWithNotes(&p.tracker, r,
 						fmt.Sprintf("Cannot assign to %q because it's an import from an injected file", name),
 						[]logger.MsgData{tracker.MsgData(js_lexer.RangeOfIdentifier(where.source, where.loc),
-							fmt.Sprintf("The symbol %q was exported from %q here:", name, where.source.PrettyPath))})
+							fmt.Sprintf("The symbol %q was exported from %q here:",
+								name, where.source.PrettyPaths.Select(p.options.logPathStyle)))})
 				}
 			}
 		}
@@ -13654,7 +14058,7 @@ func (p *parser) visitExprInOut(expr js_ast.Expr, in exprIn) (js_ast.Expr, exprO
 							{
 								Kind:       js_ast.PropertyField,
 								Key:        js_ast.Expr{Loc: expr.Loc, Data: &js_ast.EString{Value: helpers.StringToUTF16("fileName")}},
-								ValueOrNil: js_ast.Expr{Loc: expr.Loc, Data: &js_ast.EString{Value: helpers.StringToUTF16(p.source.PrettyPath)}},
+								ValueOrNil: js_ast.Expr{Loc: expr.Loc, Data: &js_ast.EString{Value: helpers.StringToUTF16(p.source.PrettyPaths.Select(p.options.codePathStyle))}},
 							},
 							{
 								Kind:       js_ast.PropertyField,
@@ -14756,7 +15160,7 @@ func (p *parser) visitExprInOut(expr js_ast.Expr, in exprIn) (js_ast.Expr, exprO
 					return js_ast.Expr{Loc: arg.Loc, Data: js_ast.ENullShared}
 				}
 
-				importRecordIndex := p.addImportRecord(ast.ImportDynamic, p.source.RangeOfString(arg.Loc), helpers.UTF16ToString(str.Value), assertOrWith, flags)
+				importRecordIndex := p.addImportRecord(ast.ImportDynamic, e.Phase, p.source.RangeOfString(arg.Loc), helpers.UTF16ToString(str.Value), assertOrWith, flags)
 				if isAwaitTarget && p.fnOrArrowDataVisit.tryBodyCount != 0 {
 					record := &p.importRecords[importRecordIndex]
 					record.Flags |= ast.HandlesImportErrors
@@ -14766,7 +15170,7 @@ func (p *parser) visitExprInOut(expr js_ast.Expr, in exprIn) (js_ast.Expr, exprO
 					record.Flags |= ast.HandlesImportErrors
 					record.ErrorHandlerLoc = p.thenCatchChain.catchLoc
 				}
-				p.importRecordsForCurrentPart = append(p.importRecordsForCurrentPart, importRecordIndex)
+				p.currentPart.ImportRecordIndices = append(p.currentPart.ImportRecordIndices, importRecordIndex)
 				return js_ast.Expr{Loc: expr.Loc, Data: &js_ast.EImportString{
 					ImportRecordIndex: importRecordIndex,
 					CloseParenLoc:     e.CloseParenLoc,
@@ -14775,7 +15179,7 @@ func (p *parser) visitExprInOut(expr js_ast.Expr, in exprIn) (js_ast.Expr, exprO
 
 			// Handle glob patterns
 			if p.options.mode == config.ModeBundle {
-				if value := p.handleGlobPattern(arg, ast.ImportDynamic, "globImport", assertOrWith); value.Data != nil {
+				if value := p.handleGlobPattern(arg, ast.ImportDynamic, e.Phase, "globImport", assertOrWith); value.Data != nil {
 					return value
 				}
 			}
@@ -14852,19 +15256,6 @@ func (p *parser) visitExprInOut(expr js_ast.Expr, in exprIn) (js_ast.Expr, exprO
 			p.thenCatchChain.catchLoc = e.Args[1].Loc
 		}
 
-		// Prepare to recognize "require.resolve()" and "Object.create" calls
-		couldBeRequireResolve := false
-		couldBeObjectCreate := false
-		if len(e.Args) == 1 {
-			if dot, ok := e.Target.Data.(*js_ast.EDot); ok && dot.OptionalChain == js_ast.OptionalChainNone {
-				if p.options.mode != config.ModePassThrough && dot.Name == "resolve" {
-					couldBeRequireResolve = true
-				} else if dot.Name == "create" {
-					couldBeObjectCreate = true
-				}
-			}
-		}
-
 		wasIdentifierBeforeVisit := false
 		isParenthesizedOptionalChain := false
 		switch e2 := e.Target.Data.(type) {
@@ -14884,7 +15275,12 @@ func (p *parser) visitExprInOut(expr js_ast.Expr, in exprIn) (js_ast.Expr, exprO
 			storeThisArgForParentOptionalChain: e.OptionalChain == js_ast.OptionalChainStart || isParenthesizedOptionalChain,
 		})
 		e.Target = target
-		p.warnAboutImportNamespaceCall(e.Target, exprKindCall)
+		p.warnAboutImportNamespaceCall(target, exprKindCall)
+
+		// Automatically mark immediately-invoked function expressions for eager compilation
+		if fn, ok := target.Data.(*js_ast.EFunction); ok {
+			fn.IsParenthesized = true
+		}
 
 		hasSpread := false
 		oldIsControlFlowDead := p.isControlFlowDead
@@ -14971,9 +15367,16 @@ func (p *parser) visitExprInOut(expr js_ast.Expr, in exprIn) (js_ast.Expr, exprO
 			return js_ast.Expr{Loc: expr.Loc, Data: js_ast.EUndefinedShared}, exprOut{}
 		}
 
-		// "foo(1, ...[2, 3], 4)" => "foo(1, 2, 3, 4)"
-		if p.options.minifySyntax && hasSpread {
-			e.Args = js_ast.InlineSpreadsOfArrayLiterals(e.Args)
+		if p.options.minifySyntax {
+			// "foo(1, ...[2, 3], 4)" => "foo(1, 2, 3, 4)"
+			if hasSpread {
+				e.Args = js_ast.InlineSpreadsOfArrayLiterals(e.Args)
+			}
+
+			// "(() => x)()" => "x"
+			if value, ok := p.maybeInlineIIFE(expr.Loc, e); ok {
+				return value, exprOut{}
+			}
 		}
 
 		switch t := target.Data.(type) {
@@ -15030,63 +15433,74 @@ func (p *parser) visitExprInOut(expr js_ast.Expr, in exprIn) (js_ast.Expr, exprO
 				}
 			}
 
-			// Optimize references to global constructors
-			if p.options.minifySyntax && t.CanBeRemovedIfUnused && len(e.Args) <= 1 && !hasSpread {
+			// Handle certain special cases
+			if len(e.Args) <= 1 && !hasSpread {
 				if symbol := &p.symbols[t.Ref.InnerIndex]; symbol.Kind == ast.SymbolUnbound {
-					// Note: We construct expressions by assigning to "expr.Data" so
-					// that the source map position for the constructor is preserved
 					switch symbol.OriginalName {
-					case "Boolean":
-						if len(e.Args) == 0 {
-							return js_ast.Expr{Loc: expr.Loc, Data: &js_ast.EBoolean{Value: false}}, exprOut{}
-						} else {
-							expr.Data = &js_ast.EUnary{Value: p.astHelpers.SimplifyBooleanExpr(e.Args[0]), Op: js_ast.UnOpNot}
-							return js_ast.Not(expr), exprOut{}
+					case "Symbol":
+						// Calling the "Symbol()" constructor with a primitive will never throw
+						if len(e.Args) == 0 || js_ast.KnownPrimitiveType(e.Args[0].Data) != js_ast.PrimitiveUnknown {
+							e.CanBeUnwrappedIfUnused = true
 						}
+					}
 
-					case "Number":
-						if len(e.Args) == 0 {
-							return js_ast.Expr{Loc: expr.Loc, Data: &js_ast.ENumber{Value: 0}}, exprOut{}
-						} else {
-							arg := e.Args[0]
+					// Optimize references to global constructors
+					if p.options.minifySyntax && t.CanBeRemovedIfUnused {
+						// Note: We construct expressions by assigning to "expr.Data" so
+						// that the source map position for the constructor is preserved
+						switch symbol.OriginalName {
+						case "Boolean":
+							if len(e.Args) == 0 {
+								return js_ast.Expr{Loc: expr.Loc, Data: &js_ast.EBoolean{Value: false}}, exprOut{}
+							} else {
+								expr.Data = &js_ast.EUnary{Value: p.astHelpers.SimplifyBooleanExpr(e.Args[0]), Op: js_ast.UnOpNot}
+								return js_ast.Not(expr), exprOut{}
+							}
 
-							switch js_ast.KnownPrimitiveType(arg.Data) {
-							case js_ast.PrimitiveNumber:
-								return arg, exprOut{}
+						case "Number":
+							if len(e.Args) == 0 {
+								return js_ast.Expr{Loc: expr.Loc, Data: &js_ast.ENumber{Value: 0}}, exprOut{}
+							} else {
+								arg := e.Args[0]
 
-							case
-								js_ast.PrimitiveUndefined, // NaN
-								js_ast.PrimitiveNull,      // 0
-								js_ast.PrimitiveBoolean,   // 0 or 1
-								js_ast.PrimitiveString:    // StringToNumber
-								if number, ok := js_ast.ToNumberWithoutSideEffects(arg.Data); ok {
-									expr.Data = &js_ast.ENumber{Value: number}
-								} else {
-									expr.Data = &js_ast.EUnary{Value: arg, Op: js_ast.UnOpPos}
+								switch js_ast.KnownPrimitiveType(arg.Data) {
+								case js_ast.PrimitiveNumber:
+									return arg, exprOut{}
+
+								case
+									js_ast.PrimitiveUndefined, // NaN
+									js_ast.PrimitiveNull,      // 0
+									js_ast.PrimitiveBoolean,   // 0 or 1
+									js_ast.PrimitiveString:    // StringToNumber
+									if number, ok := js_ast.ToNumberWithoutSideEffects(arg.Data); ok {
+										expr.Data = &js_ast.ENumber{Value: number}
+									} else {
+										expr.Data = &js_ast.EUnary{Value: arg, Op: js_ast.UnOpPos}
+									}
+									return expr, exprOut{}
 								}
-								return expr, exprOut{}
 							}
-						}
 
-					case "String":
-						if len(e.Args) == 0 {
-							return js_ast.Expr{Loc: expr.Loc, Data: &js_ast.EString{Value: nil}}, exprOut{}
-						} else {
-							arg := e.Args[0]
+						case "String":
+							if len(e.Args) == 0 {
+								return js_ast.Expr{Loc: expr.Loc, Data: &js_ast.EString{Value: nil}}, exprOut{}
+							} else {
+								arg := e.Args[0]
 
-							switch js_ast.KnownPrimitiveType(arg.Data) {
-							case js_ast.PrimitiveString:
-								return arg, exprOut{}
+								switch js_ast.KnownPrimitiveType(arg.Data) {
+								case js_ast.PrimitiveString:
+									return arg, exprOut{}
+								}
 							}
-						}
 
-					case "BigInt":
-						if len(e.Args) == 1 {
-							arg := e.Args[0]
+						case "BigInt":
+							if len(e.Args) == 1 {
+								arg := e.Args[0]
 
-							switch js_ast.KnownPrimitiveType(arg.Data) {
-							case js_ast.PrimitiveBigInt:
-								return arg, exprOut{}
+								switch js_ast.KnownPrimitiveType(arg.Data) {
+								case js_ast.PrimitiveBigInt:
+									return arg, exprOut{}
+								}
 							}
 						}
 					}
@@ -15104,57 +15518,82 @@ func (p *parser) visitExprInOut(expr js_ast.Expr, in exprIn) (js_ast.Expr, exprO
 			}
 
 		case *js_ast.EDot:
-			// Recognize "require.resolve()" calls
-			if couldBeRequireResolve && t.Name == "resolve" {
-				if id, ok := t.Target.Data.(*js_ast.EIdentifier); ok && id.Ref == p.requireRef {
-					p.ignoreUsage(p.requireRef)
-					return p.maybeTransposeIfExprChain(e.Args[0], func(arg js_ast.Expr) js_ast.Expr {
-						if str, ok := e.Args[0].Data.(*js_ast.EString); ok {
-							// Ignore calls to require.resolve() if the control flow is provably
-							// dead here. We don't want to spend time scanning the required files
-							// if they will never be used.
-							if p.isControlFlowDead {
-								return js_ast.Expr{Loc: expr.Loc, Data: js_ast.ENullShared}
-							}
+			if len(e.Args) == 1 {
+				switch t.Name {
+				case "resolve":
+					// Recognize "require.resolve()" calls
+					if t.OptionalChain == js_ast.OptionalChainNone && p.options.mode != config.ModePassThrough {
+						if id, ok := t.Target.Data.(*js_ast.EIdentifier); ok && id.Ref == p.requireRef {
+							p.ignoreUsage(p.requireRef)
+							return p.maybeTransposeIfExprChain(e.Args[0], func(arg js_ast.Expr) js_ast.Expr {
+								if str, ok := e.Args[0].Data.(*js_ast.EString); ok {
+									// Ignore calls to require.resolve() if the control flow is provably
+									// dead here. We don't want to spend time scanning the required files
+									// if they will never be used.
+									if p.isControlFlowDead {
+										return js_ast.Expr{Loc: expr.Loc, Data: js_ast.ENullShared}
+									}
 
-							importRecordIndex := p.addImportRecord(ast.ImportRequireResolve, p.source.RangeOfString(e.Args[0].Loc), helpers.UTF16ToString(str.Value), nil, 0)
-							if p.fnOrArrowDataVisit.tryBodyCount != 0 {
-								record := &p.importRecords[importRecordIndex]
-								record.Flags |= ast.HandlesImportErrors
-								record.ErrorHandlerLoc = p.fnOrArrowDataVisit.tryCatchLoc
-							}
-							p.importRecordsForCurrentPart = append(p.importRecordsForCurrentPart, importRecordIndex)
+									importRecordIndex := p.addImportRecord(ast.ImportRequireResolve, ast.EvaluationPhase, p.source.RangeOfString(e.Args[0].Loc), helpers.UTF16ToString(str.Value), nil, 0)
+									if p.fnOrArrowDataVisit.tryBodyCount != 0 {
+										record := &p.importRecords[importRecordIndex]
+										record.Flags |= ast.HandlesImportErrors
+										record.ErrorHandlerLoc = p.fnOrArrowDataVisit.tryCatchLoc
+									}
+									p.currentPart.ImportRecordIndices = append(p.currentPart.ImportRecordIndices, importRecordIndex)
 
-							// Create a new expression to represent the operation
-							return js_ast.Expr{Loc: expr.Loc, Data: &js_ast.ERequireResolveString{
-								ImportRecordIndex: importRecordIndex,
-								CloseParenLoc:     e.CloseParenLoc,
-							}}
+									// Create a new expression to represent the operation
+									return js_ast.Expr{Loc: expr.Loc, Data: &js_ast.ERequireResolveString{
+										ImportRecordIndex: importRecordIndex,
+										CloseParenLoc:     e.CloseParenLoc,
+									}}
+								}
+
+								// Otherwise just return a clone of the "require.resolve()" call
+								return js_ast.Expr{Loc: expr.Loc, Data: &js_ast.ECall{
+									Target: js_ast.Expr{Loc: e.Target.Loc, Data: &js_ast.EDot{
+										Target:  p.valueToSubstituteForRequire(t.Target.Loc),
+										Name:    t.Name,
+										NameLoc: t.NameLoc,
+									}},
+									Args:          []js_ast.Expr{arg},
+									Kind:          e.Kind,
+									CloseParenLoc: e.CloseParenLoc,
+								}}
+							}), exprOut{}
 						}
+					}
 
-						// Otherwise just return a clone of the "require.resolve()" call
-						return js_ast.Expr{Loc: expr.Loc, Data: &js_ast.ECall{
-							Target: js_ast.Expr{Loc: e.Target.Loc, Data: &js_ast.EDot{
-								Target:  p.valueToSubstituteForRequire(t.Target.Loc),
-								Name:    t.Name,
-								NameLoc: t.NameLoc,
-							}},
-							Args:          []js_ast.Expr{arg},
-							Kind:          e.Kind,
-							CloseParenLoc: e.CloseParenLoc,
-						}}
-					}), exprOut{}
-				}
-			}
+				case "for":
+					// Calling "Symbol.for()" with a primitive will never throw
+					if id, ok := t.Target.Data.(*js_ast.EIdentifier); ok {
+						if symbol := &p.symbols[id.Ref.InnerIndex]; symbol.Kind == ast.SymbolUnbound && symbol.OriginalName == "Symbol" {
+							if js_ast.KnownPrimitiveType(e.Args[0].Data) != js_ast.PrimitiveUnknown {
+								e.CanBeUnwrappedIfUnused = true
+							}
+						}
+					}
 
-			// Recognize "Object.create()" calls
-			if couldBeObjectCreate && t.Name == "create" {
-				if id, ok := t.Target.Data.(*js_ast.EIdentifier); ok {
-					if symbol := &p.symbols[id.Ref.InnerIndex]; symbol.Kind == ast.SymbolUnbound && symbol.OriginalName == "Object" {
-						switch e.Args[0].Data.(type) {
-						case *js_ast.ENull, *js_ast.EObject:
-							// Mark "Object.create(null)" and "Object.create({})" as pure
-							e.CanBeUnwrappedIfUnused = true
+				case "create":
+					// Recognize "Object.create()" calls
+					if id, ok := t.Target.Data.(*js_ast.EIdentifier); ok {
+						if symbol := &p.symbols[id.Ref.InnerIndex]; symbol.Kind == ast.SymbolUnbound && symbol.OriginalName == "Object" {
+							switch e.Args[0].Data.(type) {
+							case *js_ast.ENull, *js_ast.EObject:
+								// Mark "Object.create(null)" and "Object.create({})" as pure
+								e.CanBeUnwrappedIfUnused = true
+							}
+						}
+					}
+
+				case "escape":
+					// Recognize "RegExp.escape()" calls
+					if id, ok := t.Target.Data.(*js_ast.EIdentifier); ok {
+						if symbol := &p.symbols[id.Ref.InnerIndex]; symbol.Kind == ast.SymbolUnbound && symbol.OriginalName == "RegExp" {
+							if js_ast.KnownPrimitiveType(e.Args[0].Data) == js_ast.PrimitiveString {
+								// Mark "RegExp.escape" with a string literal as pure
+								e.CanBeUnwrappedIfUnused = true
+							}
 						}
 					}
 				}
@@ -15163,7 +15602,7 @@ func (p *parser) visitExprInOut(expr js_ast.Expr, in exprIn) (js_ast.Expr, exprO
 			if p.options.minifySyntax {
 				switch t.Name {
 				case "charCodeAt":
-					// Recognize "charCodeAt()" calls
+					// Recognize "'string'.charCodeAt()" calls
 					if str, ok := t.Target.Data.(*js_ast.EString); ok && len(e.Args) <= 1 {
 						index := 0
 						hasIndex := false
@@ -15183,7 +15622,7 @@ func (p *parser) visitExprInOut(expr js_ast.Expr, in exprIn) (js_ast.Expr, exprO
 					}
 
 				case "fromCharCode":
-					// Recognize "fromCharCode()" calls
+					// Recognize "String.fromCharCode()" calls
 					if id, ok := t.Target.Data.(*js_ast.EIdentifier); ok {
 						if symbol := &p.symbols[id.Ref.InnerIndex]; symbol.Kind == ast.SymbolUnbound && symbol.OriginalName == "String" {
 							charCodes := make([]uint16, 0, len(e.Args))
@@ -15313,13 +15752,13 @@ func (p *parser) visitExprInOut(expr js_ast.Expr, in exprIn) (js_ast.Expr, exprO
 									return js_ast.Expr{Loc: expr.Loc, Data: js_ast.ENullShared}
 								}
 
-								importRecordIndex := p.addImportRecord(ast.ImportRequire, p.source.RangeOfString(arg.Loc), helpers.UTF16ToString(str.Value), nil, 0)
+								importRecordIndex := p.addImportRecord(ast.ImportRequire, ast.EvaluationPhase, p.source.RangeOfString(arg.Loc), helpers.UTF16ToString(str.Value), nil, 0)
 								if p.fnOrArrowDataVisit.tryBodyCount != 0 {
 									record := &p.importRecords[importRecordIndex]
 									record.Flags |= ast.HandlesImportErrors
 									record.ErrorHandlerLoc = p.fnOrArrowDataVisit.tryCatchLoc
 								}
-								p.importRecordsForCurrentPart = append(p.importRecordsForCurrentPart, importRecordIndex)
+								p.currentPart.ImportRecordIndices = append(p.currentPart.ImportRecordIndices, importRecordIndex)
 
 								// Currently "require" is not converted into "import" for ESM
 								if p.options.mode != config.ModeBundle && p.options.outputFormat == config.FormatESModule && !omitWarnings {
@@ -15336,7 +15775,7 @@ func (p *parser) visitExprInOut(expr js_ast.Expr, in exprIn) (js_ast.Expr, exprO
 
 							// Handle glob patterns
 							if p.options.mode == config.ModeBundle {
-								if value := p.handleGlobPattern(arg, ast.ImportRequire, "globRequire", nil); value.Data != nil {
+								if value := p.handleGlobPattern(arg, ast.ImportRequire, ast.EvaluationPhase, "globRequire", nil); value.Data != nil {
 									return value
 								}
 							}
@@ -15450,14 +15889,9 @@ func (p *parser) visitExprInOut(expr js_ast.Expr, in exprIn) (js_ast.Expr, exprO
 		p.popScope()
 
 		if p.options.minifySyntax && len(e.Body.Block.Stmts) == 1 {
-			if s, ok := e.Body.Block.Stmts[0].Data.(*js_ast.SReturn); ok {
-				if s.ValueOrNil.Data == nil {
-					// "() => { return }" => "() => {}"
-					e.Body.Block.Stmts = []js_ast.Stmt{}
-				} else {
-					// "() => { return x }" => "() => x"
-					e.PreferExpr = true
-				}
+			if s, ok := e.Body.Block.Stmts[0].Data.(*js_ast.SReturn); ok && s.ValueOrNil.Data != nil {
+				// "() => { return x }" => "() => x"
+				e.PreferExpr = true
 			}
 		}
 
@@ -16180,7 +16614,7 @@ func remapExprLocsInJSON(expr *js_ast.Expr, table []logger.StringInJSTableEntry)
 	}
 }
 
-func (p *parser) handleGlobPattern(expr js_ast.Expr, kind ast.ImportKind, prefix string, assertOrWith *ast.ImportAssertOrWith) js_ast.Expr {
+func (p *parser) handleGlobPattern(expr js_ast.Expr, kind ast.ImportKind, phase ast.ImportPhase, prefix string, assertOrWith *ast.ImportAssertOrWith) js_ast.Expr {
 	pattern, approximateRange := p.globPatternFromExpr(expr)
 	if pattern == nil {
 		return js_ast.Expr{}
@@ -16228,8 +16662,8 @@ func (p *parser) handleGlobPattern(expr js_ast.Expr, kind ast.ImportKind, prefix
 	// Don't generate duplicate glob imports
 outer:
 	for _, globPattern := range p.globPatternImports {
-		// Check the kind
-		if globPattern.kind != kind {
+		// Check the kind and phase
+		if globPattern.kind != kind || globPattern.phase != phase {
 			continue
 		}
 
@@ -16305,6 +16739,7 @@ outer:
 			approximateRange: approximateRange,
 			ref:              ref,
 			kind:             kind,
+			phase:            phase,
 		})
 	}
 
@@ -16398,24 +16833,27 @@ func (p *parser) globPatternFromExpr(expr js_ast.Expr) ([]globPart, logger.Range
 
 func (p *parser) convertSymbolUseToCall(ref ast.Ref, isSingleNonSpreadArgCall bool) {
 	// Remove the normal symbol use
-	use := p.symbolUses[ref]
+	symbolUses := p.currentPart.SymbolUses
+	use := symbolUses[ref]
 	use.CountEstimate--
 	if use.CountEstimate == 0 {
-		delete(p.symbolUses, ref)
+		delete(symbolUses, ref)
 	} else {
-		p.symbolUses[ref] = use
+		symbolUses[ref] = use
 	}
 
 	// Add a special symbol use instead
-	if p.symbolCallUses == nil {
-		p.symbolCallUses = make(map[ast.Ref]js_ast.SymbolCallUse)
+	symbolCallUses := p.currentPart.SymbolCallUses
+	if symbolCallUses == nil {
+		symbolCallUses = make(map[ast.Ref]js_ast.SymbolCallUse)
+		p.currentPart.SymbolCallUses = symbolCallUses
 	}
-	callUse := p.symbolCallUses[ref]
+	callUse := symbolCallUses[ref]
 	callUse.CallCountEstimate++
 	if isSingleNonSpreadArgCall {
 		callUse.SingleArgNonSpreadCallCountEstimate++
 	}
-	p.symbolCallUses[ref] = callUse
+	symbolCallUses[ref] = callUse
 }
 
 func (p *parser) warnAboutImportNamespaceCall(target js_ast.Expr, kind importNamespaceCallKind) {
@@ -17081,7 +17519,7 @@ func (p *parser) scanForImportsAndExports(stmts []js_ast.Stmt) (result importsEx
 							}
 
 							// Also record these automatically-generated top-level namespace alias symbols
-							p.declaredSymbols = append(p.declaredSymbols, js_ast.DeclaredSymbol{
+							p.currentPart.DeclaredSymbols = append(p.currentPart.DeclaredSymbols, js_ast.DeclaredSymbol{
 								Ref:        name.Ref,
 								IsTopLevel: true,
 							})
@@ -17119,7 +17557,7 @@ func (p *parser) scanForImportsAndExports(stmts []js_ast.Stmt) (result importsEx
 				}
 			}
 
-			p.importRecordsForCurrentPart = append(p.importRecordsForCurrentPart, s.ImportRecordIndex)
+			p.currentPart.ImportRecordIndices = append(p.currentPart.ImportRecordIndices, s.ImportRecordIndex)
 
 			if s.StarNameLoc != nil {
 				record.Flags |= ast.ContainsImportStar
@@ -17170,7 +17608,7 @@ func (p *parser) scanForImportsAndExports(stmts []js_ast.Stmt) (result importsEx
 
 		case *js_ast.SExportStar:
 			record := &p.importRecords[s.ImportRecordIndex]
-			p.importRecordsForCurrentPart = append(p.importRecordsForCurrentPart, s.ImportRecordIndex)
+			p.currentPart.ImportRecordIndices = append(p.currentPart.ImportRecordIndices, s.ImportRecordIndex)
 
 			if s.Alias != nil {
 				// "export * as ns from 'path'"
@@ -17191,7 +17629,7 @@ func (p *parser) scanForImportsAndExports(stmts []js_ast.Stmt) (result importsEx
 
 		case *js_ast.SExportFrom:
 			record := &p.importRecords[s.ImportRecordIndex]
-			p.importRecordsForCurrentPart = append(p.importRecordsForCurrentPart, s.ImportRecordIndex)
+			p.currentPart.ImportRecordIndices = append(p.currentPart.ImportRecordIndices, s.ImportRecordIndex)
 
 			for _, item := range s.Items {
 				// Note that the imported alias is not item.Alias, which is the
@@ -17242,17 +17680,11 @@ func (p *parser) scanForImportsAndExports(stmts []js_ast.Stmt) (result importsEx
 }
 
 func (p *parser) appendPart(parts []js_ast.Part, stmts []js_ast.Stmt) []js_ast.Part {
-	p.symbolUses = make(map[ast.Ref]js_ast.SymbolUse)
-	p.importSymbolPropertyUses = nil
-	p.symbolCallUses = nil
-	p.declaredSymbols = nil
-	p.importRecordsForCurrentPart = nil
-	p.scopesForCurrentPart = nil
-
 	part := js_ast.Part{
-		Stmts:      p.visitStmtsAndPrependTempRefs(stmts, prependTempRefsOpts{}),
-		SymbolUses: p.symbolUses,
+		SymbolUses: make(map[ast.Ref]js_ast.SymbolUse),
 	}
+	p.currentPart = &part
+	part.Stmts = p.visitStmtsAndPrependTempRefs(stmts, prependTempRefsOpts{})
 
 	// Sanity check
 	if p.currentScope != p.moduleScope {
@@ -17294,13 +17726,11 @@ func (p *parser) appendPart(parts []js_ast.Part, stmts []js_ast.Stmt) []js_ast.P
 			flags |= js_ast.KeepExportClauses
 		}
 		part.CanBeRemovedIfUnused = p.astHelpers.StmtsCanBeRemovedIfUnused(part.Stmts, flags)
-		part.DeclaredSymbols = p.declaredSymbols
-		part.ImportRecordIndices = p.importRecordsForCurrentPart
-		part.ImportSymbolPropertyUses = p.importSymbolPropertyUses
-		part.SymbolCallUses = p.symbolCallUses
-		part.Scopes = p.scopesForCurrentPart
 		parts = append(parts, part)
 	}
+
+	// Reset the state for this part so we don't accidentally mutate it
+	p.currentPart = nil
 	return parts
 }
 
@@ -17699,31 +18129,48 @@ func Parse(log logger.Log, source logger.Source, options Options) (result js_ast
 	return
 }
 
-func LazyExportAST(log logger.Log, source logger.Source, options Options, expr js_ast.Expr, apiCall string) js_ast.AST {
+type HelperCall struct {
+	Global  []string
+	Runtime string
+}
+
+func LazyExportAST(log logger.Log, source logger.Source, options Options, expr js_ast.Expr, helperCall *HelperCall) js_ast.AST {
 	// Don't create a new lexer using js_lexer.NewLexer() here since that will
 	// actually attempt to parse the first token, which might cause a syntax
 	// error.
 	p := newParser(log, source, js_lexer.Lexer{}, &options)
 	p.prepareForVisitPass()
 
-	// Optionally call a runtime API function to transform the expression
-	if apiCall != "" {
-		p.symbolUses = make(map[ast.Ref]js_ast.SymbolUse)
-		expr = p.callRuntime(expr.Loc, apiCall, []js_ast.Expr{expr})
+	// Defer the actual code generation until linking
+	part := js_ast.Part{
+		SymbolUses: make(map[ast.Ref]js_ast.SymbolUse),
 	}
+
+	// Optionally call a runtime API function to transform the expression
+	if helperCall != nil {
+		p.currentPart = &part
+		if len(helperCall.Global) > 0 {
+			ref := p.newSymbol(ast.SymbolUnbound, helperCall.Global[0])
+			p.recordUsage(ref)
+			target := js_ast.Expr{Data: &js_ast.EIdentifier{Ref: ref}}
+			kind := js_ast.NormalCall
+			for _, name := range helperCall.Global[1:] {
+				target.Data = &js_ast.EDot{Target: target, Name: name}
+				kind = js_ast.TargetWasOriginallyPropertyAccess
+			}
+			expr.Data = &js_ast.ECall{Target: target, Args: []js_ast.Expr{expr}, Kind: kind}
+		} else {
+			expr = p.callRuntime(expr.Loc, helperCall.Runtime, []js_ast.Expr{expr})
+		}
+		p.currentPart = nil
+	}
+	part.Stmts = []js_ast.Stmt{{Loc: expr.Loc, Data: &js_ast.SLazyExport{Value: expr}}}
 
 	// Add an empty part for the namespace export that we can fill in later
 	nsExportPart := js_ast.Part{
 		SymbolUses:           make(map[ast.Ref]js_ast.SymbolUse),
 		CanBeRemovedIfUnused: true,
 	}
-
-	// Defer the actual code generation until linking
-	part := js_ast.Part{
-		Stmts:      []js_ast.Stmt{{Loc: expr.Loc, Data: &js_ast.SLazyExport{Value: expr}}},
-		SymbolUses: p.symbolUses,
-	}
-	p.symbolUses = nil
 
 	ast := p.toAST([]js_ast.Part{nsExportPart}, []js_ast.Part{part}, nil, "", nil)
 	ast.HasLazyExport = true
@@ -17753,22 +18200,22 @@ func GlobResolveAST(log logger.Log, source logger.Source, importRecords []ast.Im
 		importRecordIndices = append(importRecordIndices, uint32(importRecordIndex))
 	}
 
-	p.symbolUses = make(map[ast.Ref]js_ast.SymbolUse)
 	ref := p.newSymbol(ast.SymbolOther, name)
 	p.moduleScope.Generated = append(p.moduleScope.Generated, ref)
-
 	part := js_ast.Part{
-		Stmts: []js_ast.Stmt{{Data: &js_ast.SLocal{
-			IsExport: true,
-			Decls: []js_ast.Decl{{
-				Binding:    js_ast.Binding{Data: &js_ast.BIdentifier{Ref: ref}},
-				ValueOrNil: p.callRuntime(logger.Loc{}, "__glob", []js_ast.Expr{{Data: object}}),
-			}},
-		}}},
 		ImportRecordIndices: importRecordIndices,
-		SymbolUses:          p.symbolUses,
+		SymbolUses:          make(map[ast.Ref]js_ast.SymbolUse),
 	}
-	p.symbolUses = nil
+
+	p.currentPart = &part
+	part.Stmts = []js_ast.Stmt{{Data: &js_ast.SLocal{
+		IsExport: true,
+		Decls: []js_ast.Decl{{
+			Binding:    js_ast.Binding{Data: &js_ast.BIdentifier{Ref: ref}},
+			ValueOrNil: p.callRuntime(logger.Loc{}, "__glob", []js_ast.Expr{{Data: object}}),
+		}},
+	}}}
+	p.currentPart = nil
 
 	p.esmExportKeyword.Len = 1
 	return p.toAST([]js_ast.Part{nsExportPart}, []js_ast.Part{part}, nil, "", nil)
@@ -17832,7 +18279,7 @@ const (
 	whyESMImportStatement
 )
 
-// Say why this the current file is being considered an ES module
+// Say why the current file is being considered an ES module
 func (p *parser) whyESModule() (whyESM, []logger.MsgData) {
 	because := "This file is considered to be an ECMAScript module because"
 	switch {
@@ -18105,7 +18552,7 @@ func (p *parser) generateImportStmt(
 	p.moduleScope.Generated = append(p.moduleScope.Generated, namespaceRef)
 	declaredSymbols := make([]js_ast.DeclaredSymbol, 1+len(imports))
 	clauseItems := make([]js_ast.ClauseItem, len(imports))
-	importRecordIndex := p.addImportRecord(ast.ImportStmt, pathRange, path, nil, 0)
+	importRecordIndex := p.addImportRecord(ast.ImportStmt, ast.EvaluationPhase, pathRange, path, nil, 0)
 	if sourceIndex != nil {
 		p.importRecords[importRecordIndex].SourceIndex = ast.MakeIndex32(*sourceIndex)
 	}
@@ -18193,6 +18640,7 @@ func (p *parser) toAST(before, parts, after []js_ast.Part, hashbang string, dire
 		before, importRecordIndex = p.generateImportStmt(helpers.GlobPatternToString(glob.parts), glob.approximateRange, []string{glob.name}, before, symbols, nil, nil)
 		record := &p.importRecords[importRecordIndex]
 		record.AssertOrWith = glob.assertOrWith
+		record.Phase = glob.phase
 		record.GlobPattern = &ast.GlobPattern{
 			Parts:       glob.parts,
 			ExportAlias: glob.name,
@@ -18223,16 +18671,12 @@ func (p *parser) toAST(before, parts, after []js_ast.Part, hashbang string, dire
 	removedImportEquals := false
 	partsEnd := 0
 	for partIndex, part := range parts {
-		p.importRecordsForCurrentPart = nil
-		p.declaredSymbols = nil
-
+		p.currentPart = &part
 		result := p.scanForImportsAndExports(part.Stmts)
+		p.currentPart = nil
 		part.Stmts = result.stmts
 		keptImportEquals = keptImportEquals || result.keptImportEquals
 		removedImportEquals = removedImportEquals || result.removedImportEquals
-
-		part.ImportRecordIndices = append(part.ImportRecordIndices, p.importRecordsForCurrentPart...)
-		part.DeclaredSymbols = append(part.DeclaredSymbols, p.declaredSymbols...)
 
 		if len(part.Stmts) > 0 || uint32(partIndex) == js_ast.NSExportPartIndex {
 			if p.moduleScope.ContainsDirectEval && len(part.DeclaredSymbols) > 0 {
