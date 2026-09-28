@@ -15,7 +15,7 @@ import (
 type singleNodeOptions struct {
 	Socket          *socketOptions `json:"socket,omitempty"`
 	Username        string         `json:"username,omitempty"`
-	Password        string         `json:"password,omitempty"`
+	Password        string         `json:"password,omitempty"` //nolint:gosec
 	ClientName      string         `json:"clientName,omitempty"`
 	Database        int            `json:"database,omitempty"`
 	MaxRetries      int            `json:"maxRetries,omitempty"`
@@ -88,11 +88,11 @@ type sentinelOptions struct {
 
 // newOptionsFromObject validates and instantiates an options struct from its
 // map representation as exported from sobek.Runtime.
-func newOptionsFromObject(obj map[string]interface{}) (*redis.UniversalOptions, error) {
-	var options interface{}
-	if cluster, ok := obj["cluster"].(map[string]interface{}); ok {
+func newOptionsFromObject(obj map[string]any) (*redis.UniversalOptions, error) {
+	var options any
+	if cluster, ok := obj["cluster"].(map[string]any); ok {
 		obj = cluster
-		nodes, ok := cluster["nodes"].([]interface{})
+		nodes, ok := cluster["nodes"].([]any)
 		if !ok {
 			return nil, fmt.Errorf("cluster nodes property must be an array; got %T", cluster["nodes"])
 		}
@@ -100,7 +100,7 @@ func newOptionsFromObject(obj map[string]interface{}) (*redis.UniversalOptions, 
 			return nil, errors.New("cluster nodes property cannot be empty")
 		}
 		switch nodes[0].(type) {
-		case map[string]interface{}:
+		case map[string]any:
 			options = &clusterNodesMapOptions{}
 		case string:
 			options = &clusterNodesStringOptions{}
@@ -142,7 +142,7 @@ func newOptionsFromString(url string) (*redis.UniversalOptions, error) {
 	return toUniversalOptions(opts)
 }
 
-func readOptions(options interface{}) (*redis.UniversalOptions, error) {
+func readOptions(options any) (*redis.UniversalOptions, error) {
 	var (
 		opts *redis.UniversalOptions
 		err  error
@@ -150,7 +150,7 @@ func readOptions(options interface{}) (*redis.UniversalOptions, error) {
 	switch val := options.(type) {
 	case string:
 		opts, err = newOptionsFromString(val)
-	case map[string]interface{}:
+	case map[string]any:
 		opts, err = newOptionsFromObject(val)
 	default:
 		return nil, fmt.Errorf("invalid options type: %T; expected string or object", val)
@@ -163,7 +163,7 @@ func readOptions(options interface{}) (*redis.UniversalOptions, error) {
 	return opts, nil
 }
 
-func toUniversalOptions(options interface{}) (*redis.UniversalOptions, error) {
+func toUniversalOptions(options any) (*redis.UniversalOptions, error) {
 	uopts := &redis.UniversalOptions{Protocol: 2}
 
 	switch o := options.(type) {
@@ -226,7 +226,8 @@ func toUniversalOptions(options interface{}) (*redis.UniversalOptions, error) {
 // previously set values are consistent with the new values. This validates that
 // multiple node options set when using cluster mode are consistent with each other.
 // TODO: Break apart, simplify?
-//nolint: gocognit,cyclop,funlen,gofmt,gofumpt,goimports
+//
+//nolint:gocognit,cyclop,funlen
 func setConsistentOptions(uopts *redis.UniversalOptions, opts *redis.Options) error {
 	uopts.Addrs = append(uopts.Addrs, opts.Addr)
 
@@ -337,7 +338,7 @@ func setSocketOptions(opts *redis.Options, sopts *socketOptions) error {
 	opts.ConnMaxIdleTime = time.Duration(sopts.IdleTimeout) * time.Millisecond
 
 	if sopts.TLS != nil {
-		//nolint: gosec // ignore G402: TLS MinVersion too low
+		//#nosec G402
 		tlsCfg := &tls.Config{}
 		if len(sopts.TLS.CA) > 0 {
 			caCertPool := x509.NewCertPool()
