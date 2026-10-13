@@ -47,7 +47,7 @@ func NewWriter(w io.Writer, opts ...WriterOption) *Writer {
 	w2.obufLen = obufHeaderLen + MaxEncodedLen(w2.blockSize)
 	w2.paramsOK = true
 	w2.ibuf = make([]byte, 0, w2.blockSize)
-	w2.buffers.New = func() interface{} {
+	w2.buffers.New = func() any {
 		return make([]byte, w2.obufLen)
 	}
 	w2.Reset(w)
@@ -139,11 +139,9 @@ func (w *Writer) Reset(writer io.Writer) {
 
 	toWrite := make(chan chan result, w.concurrency)
 	w.output = toWrite
-	w.writerWg.Add(1)
 
 	// Start a writer goroutine that will write all output in order.
-	go func() {
-		defer w.writerWg.Done()
+	w.writerWg.Go(func() {
 
 		// Get a queued write.
 		for write := range toWrite {
@@ -175,7 +173,7 @@ func (w *Writer) Reset(writer io.Writer) {
 			// This can be used for synchronizing flushes.
 			close(write)
 		}
-	}()
+	})
 }
 
 // Write satisfies the io.Writer interface.

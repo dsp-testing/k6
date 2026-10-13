@@ -53,6 +53,7 @@ var (
 	reflectTypeArrayPtr = reflect.TypeOf((*[]interface{})(nil))
 	reflectTypeString   = reflect.TypeOf("")
 	reflectTypeFunc     = reflect.TypeOf((func(FunctionCall) Value)(nil))
+	reflectTypeCtor     = reflect.TypeOf((func(ConstructorCall) *Object)(nil))
 	reflectTypeError    = reflect.TypeOf((*error)(nil)).Elem()
 )
 
@@ -111,12 +112,11 @@ type valueUndefined struct {
 	valueNull
 }
 
-// *Symbol is a Value containing ECMAScript Symbol primitive. Symbols must only be created
+// Symbol is a Value containing ECMAScript Symbol primitive. Symbols must only be created
 // using NewSymbol(). Zero values and copying of values (i.e. *s1 = *s2) are not permitted.
 // Well-known Symbols can be accessed using Sym* package variables (SymIterator, etc...)
 // Symbols can be shared by multiple Runtimes.
 type Symbol struct {
-	h    uintptr
 	desc String
 }
 
@@ -764,6 +764,8 @@ func (o *Object) baseObject(*Runtime) *Object {
 // Export the Object to a plain Go type.
 // If the Object is a wrapped Go value (created using ToValue()) returns the original value.
 //
+// If the Object is a class function, returns func(ConstructorCall) *Object. See the note about exceptions below.
+//
 // If the Object is a function, returns func(FunctionCall) Value. Note that exceptions thrown inside the function
 // result in panics, which can also leave the Runtime in an unusable state. Therefore, these values should only
 // be used inside another ES function implemented in Go. For calling a function from Go, use AssertFunction() or
@@ -796,7 +798,7 @@ func (o *Object) ExportType() reflect.Type {
 }
 
 func (o *Object) hash(*maphash.Hash) uint64 {
-	return o.getId()
+	return uint64(uintptr(unsafe.Pointer(o)))
 }
 
 // Get an object's property by name.
@@ -1124,7 +1126,11 @@ func (s *Symbol) baseObject(r *Runtime) *Object {
 }
 
 func (s *Symbol) hash(*maphash.Hash) uint64 {
-	return uint64(s.h)
+	// This may need to be reconsidered in the future.
+	// Depending on changes in Go's allocation policy and/or introduction of a compacting GC
+	// this may no longer provide sufficient dispersion. The alternative, however, is a globally
+	// synchronised random generator/hasher/sequencer and I don't want to go down that route just yet.
+	return uint64(uintptr(unsafe.Pointer(s)))
 }
 
 func exportValue(v Value, ctx *objectExportCtx) interface{} {
@@ -1135,15 +1141,9 @@ func exportValue(v Value, ctx *objectExportCtx) interface{} {
 }
 
 func newSymbol(s String) *Symbol {
-	r := &Symbol{
+	return &Symbol{
 		desc: s,
 	}
-	// This may need to be reconsidered in the future.
-	// Depending on changes in Go's allocation policy and/or introduction of a compacting GC
-	// this may no longer provide sufficient dispersion. The alternative, however, is a globally
-	// synchronised random generator/hasher/sequencer and I don't want to go down that route just yet.
-	r.h = uintptr(unsafe.Pointer(r))
-	return r
 }
 
 func NewSymbol(s string) *Symbol {
