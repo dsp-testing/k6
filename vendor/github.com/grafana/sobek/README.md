@@ -12,7 +12,7 @@ This project is a fork of [goja](https://github.com/dop251/goja).
 
 This project was largely inspired by [otto](https://github.com/robertkrimen/otto).
 
-The minimum required Go version is 1.21.
+The minimum required Go version is 1.25.
 
 Features
 --------
@@ -39,36 +39,6 @@ For this reason it is very likely that it will be updated in breaking manner in 
 For any usage info or bare documentation it is recommended to look at the tests in [modules_test.go](https://github.com/grafana/sobek/blob/main/modules_test.go) and [modules_integration_test.go](https://github.com/grafana/sobek/blob/main/modules_integration_test.go).
 
 Also of note is that due to the nature of ESM you need to have an event loop implementation to use it. That is still not provided by Sobek and likely never will be.
-
-### WeakMap
-WeakMap is implemented by embedding references to the values into the keys. This means that as long
-as the key is reachable all values associated with it in any weak maps also remain reachable and therefore
-cannot be garbage collected even if they are not otherwise referenced, even after the WeakMap is gone.
-The reference to the value is dropped either when the key is explicitly removed from the WeakMap or when the
-key becomes unreachable.
-
-To illustrate this:
-
-```javascript
-var m = new WeakMap();
-var key = {};
-var value = {/* a very large object */};
-m.set(key, value);
-value = undefined;
-m = undefined; // The value does NOT become garbage-collectable at this point
-key = undefined; // Now it does
-// m.delete(key); // This would work too
-```
-
-The reason for it is the limitation of the Go runtime. At the time of writing (version 1.15) having a finalizer
-set on an object which is part of a reference cycle makes the whole cycle non-garbage-collectable. The solution
-above is the only reasonable way I can think of without involving finalizers. This is the third attempt
-(see https://github.com/dop251/goja/issues/250 and https://github.com/dop251/goja/issues/199 for more details).
-
-Note, this does not have any effect on the application logic, but may cause a higher-than-expected memory usage.
-
-### WeakRef and FinalizationRegistry
-For the reason mentioned above implementing WeakRef and FinalizationRegistry does not seem to be possible at this stage.
 
 ### JSON
 `JSON.parse()` uses the standard Go library which operates in UTF-8. Therefore, it cannot correctly parse broken UTF-16
@@ -342,3 +312,29 @@ func TestInterrupt(t *testing.T) {
     // err is of type *InterruptError and its Value() method returns whatever has been passed to vm.Interrupt()
 }
 ```
+
+Step-by-step Guide on Merging Goja back into Sobek
+--------------------------------------------------
+
+Since Sobek is a fork of Goja, we need to update Sobek when changes are made in Goja. The steps below will help you through how we bring those changes from Goja into Sobek.
+
+1. Since you're working in the Sobek repo, the assumption is that the remote is pointing to https://github.com/grafana/sobek.git as `origin`. So first we need to add Goja as a remote too, but we will call it `goja` since sobek is set to `origin`. Do this with:
+    `git remote add goja https://github.com/dop251/goja.git`
+
+2. to confirm the change run `git remote -v`
+
+    which should result in:
+
+    ```shell
+    goja    https://github.com/dop251/goja.git (fetch)
+    goja    https://github.com/dop251/goja.git (push)
+    origin  https://github.com/grafana/sobek.git (fetch)
+    origin  https://github.com/grafana/sobek.git (push)
+    ```
+3. Make sure you're on `main` with `git checkout main`
+4. Run `git fetch --all` to fetch all changes from all remotes.
+5. Create a new branch for the merge with `git checkout -b merge-goja-master`
+6. Merge goja/master into your branch with `git merge goja/master`
+7. Review the changes and run tests
+8. Push the branch to `origin` and create a new PR with `git push`
+9. **Important: Use MERGE (not rebase or squash) in the PR** -- This preserves history and helps avoid future merge conflicts
