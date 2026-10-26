@@ -9,7 +9,7 @@ package api
 // esbuild will automatically generate a directory listing page with links for
 // each file in the directory. If there is a build configured that generates
 // output files, those output files are not written to disk but are instead
-// "overlayed" virtually on top of the real file system. The server responds to
+// "overlaid" virtually on top of the real file system. The server responds to
 // HTTP requests for output files from the build with the latest in-memory
 // build results.
 
@@ -49,6 +49,7 @@ type apiHandler struct {
 	certfileToLower  string
 	fallback         string
 	hosts            []string
+	corsOrigin       []string
 	serveWaitGroup   sync.WaitGroup
 	activeStreams    []chan serverSentEvent
 	currentHashes    map[string]string
@@ -104,6 +105,25 @@ func errorsToString(errors []Message) string {
 func (h *apiHandler) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	start := time.Now()
 
+	// Add CORS headers to all relevant requests
+	if origin := req.Header.Get("Origin"); origin != "" {
+		for _, allowed := range h.corsOrigin {
+			if allowed == "*" {
+				res.Header().Set("Access-Control-Allow-Origin", "*")
+				break
+			} else if star := strings.IndexByte(allowed, '*'); star >= 0 {
+				prefix, suffix := allowed[:star], allowed[star+1:]
+				if len(origin) >= len(prefix)+len(suffix) && strings.HasPrefix(origin, prefix) && strings.HasSuffix(origin, suffix) {
+					res.Header().Set("Access-Control-Allow-Origin", origin)
+					break
+				}
+			} else if origin == allowed {
+				res.Header().Set("Access-Control-Allow-Origin", origin)
+				break
+			}
+		}
+	}
+
 	// HEAD requests omit the body
 	maybeWriteResponseBody := func(bytes []byte) { res.Write(bytes) }
 	isHEAD := req.Method == "HEAD"
@@ -132,6 +152,14 @@ func (h *apiHandler) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 			maybeWriteResponseBody([]byte(fmt.Sprintf("403 - Forbidden: The host %q is not allowed", req.Host)))
 			return
 		}
+	}
+
+	// All requests containing Windows-style path separators are invalid
+	if strings.ContainsRune(req.URL.Path, '\\') {
+		go h.notifyRequest(time.Since(start), req, http.StatusBadRequest)
+		res.WriteHeader(http.StatusBadRequest)
+		maybeWriteResponseBody([]byte("400 - Bad Request"))
+		return
 	}
 
 	// Special-case the esbuild event stream
@@ -199,18 +227,19 @@ func (h *apiHandler) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 		// Check for a file in the "servedir" directory
 		if h.servedir != "" && kind != fs.FileEntry {
 			absPath := h.fs.Join(h.servedir, queryPath)
+			if symlink, ok := h.fs.EvalSymlinks(absPath); ok {
+				absPath = symlink
+			}
 			if absDir := h.fs.Dir(absPath); absDir != absPath {
 				if entries, err, _ := h.fs.ReadDirectory(absDir); err == nil {
 					if entry, _ := entries.Get(h.fs.Base(absPath)); entry != nil && entry.Kind(h.fs) == fs.FileEntry {
-						if h.keyfileToLower != "" || h.certfileToLower != "" {
-							if toLower := strings.ToLower(absPath); toLower == h.keyfileToLower || toLower == h.certfileToLower {
-								// Don't serve the HTTPS key or certificate. This uses a case-
-								// insensitive check because some file systems are case-sensitive.
-								go h.notifyRequest(time.Since(start), req, http.StatusForbidden)
-								res.WriteHeader(http.StatusForbidden)
-								maybeWriteResponseBody([]byte("403 - Forbidden"))
-								return
-							}
+						if strings.EqualFold(absPath, h.keyfileToLower) || strings.EqualFold(absPath, h.certfileToLower) {
+							// Don't serve the HTTPS key or certificate. This uses a case-
+							// insensitive check because some file systems are case-sensitive.
+							go h.notifyRequest(time.Since(start), req, http.StatusForbidden)
+							res.WriteHeader(http.StatusForbidden)
+							maybeWriteResponseBody([]byte("403 - Forbidden"))
+							return
 						}
 						if contents, err, _ := h.fs.OpenFile(absPath); err == nil {
 							defer contents.Close()
@@ -318,12 +347,28 @@ func (h *apiHandler) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 				return
 			}
 
-			// If we get here, the request was successful
-			if contentType := helpers.MimeTypeByExtension(h.fs.Ext(file.absPath)); contentType != "" {
-				res.Header().Set("Content-Type", contentType)
-			} else {
-				res.Header().Set("Content-Type", "application/octet-stream")
+			// Try to detect the MIME type
+			contentType := helpers.MimeTypeByExtension(h.fs.Ext(file.absPath))
+			if contentType == "" {
+				if begin == 0 {
+					contentType = http.DetectContentType(fileBytes)
+				} else {
+					// Read the file header for MIME type detection of HTTP range requests
+					limit := 512
+					if limit > fileContentsLen {
+						limit = fileContentsLen
+					}
+					if headerBytes, err := file.contents.Read(0, limit); err == nil {
+						contentType = http.DetectContentType(headerBytes)
+					}
+				}
 			}
+			if contentType == "" {
+				contentType = "application/octet-stream"
+			}
+
+			// If we get here, the request was successful
+			res.Header().Set("Content-Type", contentType)
 			if isRange {
 				res.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", begin, end-1, fileContentsLen))
 			}
@@ -648,7 +693,7 @@ func respondWithDirList(queryPath string, dirEntries map[string]bool, fileEntrie
 	for i, part := range parts {
 		if i+1 < len(parts) {
 			html.WriteString("<a href=\"")
-			html.WriteString(escapeForHTML(strings.Join(parts[:i+1], "/")))
+			html.WriteString(escapeForAttribute(strings.Join(parts[:i+1], "/")))
 			html.WriteString("/\">")
 		}
 		html.WriteString(escapeForHTML(part))
@@ -736,6 +781,13 @@ func (ctx *internalContext) Serve(serveOptions ServeOptions) (ServeResult, error
 		}
 	}
 
+	// Validate the CORS origins
+	for _, origin := range serveOptions.CORS.Origin {
+		if star := strings.IndexByte(origin, '*'); star >= 0 && strings.ContainsRune(origin[star+1:], '*') {
+			return ServeResult{}, fmt.Errorf("Invalid origin: %s", origin)
+		}
+	}
+
 	// Stuff related to the output directory only matters if there are entry points
 	outdirPathPrefix := ""
 	if len(ctx.args.entryPoints) > 0 {
@@ -774,12 +826,19 @@ func (ctx *internalContext) Serve(serveOptions ServeOptions) (ServeResult, error
 	var listener net.Listener
 	network := "tcp4"
 	host := "0.0.0.0"
+	hostIsIP := true
 	if serveOptions.Host != "" {
 		host = serveOptions.Host
+		ip := net.ParseIP(host)
 
 		// Only use "tcp4" if this is an IPv4 address, otherwise use "tcp"
-		if ip := net.ParseIP(host); ip == nil || ip.To4() == nil {
+		if ip == nil || ip.To4() == nil {
 			network = "tcp"
+		}
+
+		// Remember whether the host is a valid IP address or not
+		if ip == nil {
+			hostIsIP = false
 		}
 	}
 
@@ -833,11 +892,25 @@ func (ctx *internalContext) Serve(serveOptions ServeOptions) (ServeResult, error
 		result.Hosts = append(result.Hosts, boundHost)
 	}
 
+	// If the host isn't a valid IP address, add it to the list of allowed hosts.
+	// For example, mapping "local.example.com" to "127.0.0.1" in "/etc/hosts"
+	// and then using "--serve=local.example.com:8000" should make it possible to
+	// successfully visit "http://local.example.com:8000/" in a browser.
+	if !hostIsIP {
+		result.Hosts = append(result.Hosts, host)
+	}
+
 	// HTTPS-related files should be absolute paths
 	isHTTPS := serveOptions.Keyfile != "" && serveOptions.Certfile != ""
 	if isHTTPS {
 		serveOptions.Keyfile, _ = ctx.realFS.Abs(serveOptions.Keyfile)
 		serveOptions.Certfile, _ = ctx.realFS.Abs(serveOptions.Certfile)
+		if symlink, ok := ctx.realFS.EvalSymlinks(serveOptions.Keyfile); ok {
+			serveOptions.Keyfile = symlink
+		}
+		if symlink, ok := ctx.realFS.EvalSymlinks(serveOptions.Certfile); ok {
+			serveOptions.Certfile = symlink
+		}
 	}
 
 	var shouldStop int32
@@ -853,6 +926,7 @@ func (ctx *internalContext) Serve(serveOptions ServeOptions) (ServeResult, error
 		certfileToLower:  strings.ToLower(serveOptions.Certfile),
 		fallback:         serveOptions.Fallback,
 		hosts:            append([]string{}, result.Hosts...),
+		corsOrigin:       append([]string{}, serveOptions.CORS.Origin...),
 		rebuild: func() BuildResult {
 			if atomic.LoadInt32(&shouldStop) != 0 {
 				// Don't start more rebuilds if we were told to stop

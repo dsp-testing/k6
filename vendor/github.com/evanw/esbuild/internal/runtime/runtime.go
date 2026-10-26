@@ -170,18 +170,40 @@ func Source(unsupportedJSFeatures compat.JSFeature) logger.Source {
 		// This is for lazily-initialized ESM code. This has two implementations, a
 		// compact one for minified code and a verbose one that generates friendly
 		// names in V8's profiler and in stack traces.
-		export var __esm = (fn, res) => function __init() {
-			return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res
+		export var __esm = (fn, res, err) => function __init() {
+			if (err) throw err[0]
+			try {
+				return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res
+			} catch (e) {
+				throw err = [e], e
+			}
 		}
-		export var __esmMin = (fn, res) => () => (fn && (res = fn(fn = 0)), res)
+		export var __esmMin = (fn, res, err) => () => {
+			if (err) throw err[0]
+			try {
+				return fn && (res = fn(fn = 0)), res
+			} catch (e) {
+				throw err = [e], e
+			}
+		}
 
 		// Wraps a CommonJS closure and returns a require() function. This has two
 		// implementations, a compact one for minified code and a verbose one that
 		// generates friendly names in V8's profiler and in stack traces.
 		export var __commonJS = (cb, mod) => function __require() {
-			return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = {exports: {}}).exports, mod), mod.exports
+			try {
+				return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports
+			} catch (e) {
+				throw mod = 0, e
+			}
 		}
-		export var __commonJSMin = (cb, mod) => () => (mod || cb((mod = {exports: {}}).exports, mod), mod.exports)
+		export var __commonJSMin = (cb, mod) => () => {
+			try {
+				return mod || cb((mod = { exports: {} }).exports, mod), mod.exports
+			} catch (e) {
+				throw mod = 0, e
+			}
+		}
 
 		// Used to implement ESM exports both for "require()" and "import * as"
 		export var __export = (target, all) => {
@@ -426,7 +448,14 @@ func Source(unsupportedJSFeatures compat.JSFeature) logger.Source {
 				} catch (e) {
 					no(e)
 				}
-			}, method = k => it[k] = x => new Promise((yes, no) => resume(k, x, yes, no)), it = {}
+			}, method = (k, call, wait, clear) => it[k] = x => (
+				call = new Promise((yes, no, run) => (
+					run = () => resume(k, x, yes, no),
+					q ? q.then(run) : run())),
+				clear = () => q === wait && (q = 0),
+				q = wait = call.then(clear, clear),
+				call
+			), q, it = {}
 			return generator = generator.apply(__this, __arguments),
 				it[__knownSymbol('asyncIterator')] = () => it,
 				method('next'),
@@ -484,8 +513,8 @@ func Source(unsupportedJSFeatures compat.JSFeature) logger.Source {
 					it)
 
 		// This is for the "binary" loader (custom code is ~2x faster than "atob")
-		export var __toBinaryNode = base64 => new Uint8Array(Buffer.from(base64, 'base64'))
-		export var __toBinary = /* @__PURE__ */ (() => {
+		export var __toBinaryNode = Uint8Array.fromBase64 || (base64 => new Uint8Array(Buffer.from(base64, 'base64')))
+		export var __toBinary = Uint8Array.fromBase64 || /* @__PURE__ */ (() => {
 			var table = new Uint8Array(128)
 			for (var i = 0; i < 64; i++) table[i < 26 ? i + 65 : i < 52 ? i + 71 : i < 62 ? i - 4 : i * 4 - 205] = i
 			return base64 => {
@@ -541,7 +570,7 @@ func Source(unsupportedJSFeatures compat.JSFeature) logger.Source {
 	return logger.Source{
 		Index:          SourceIndex,
 		KeyPath:        logger.Path{Text: "<runtime>"},
-		PrettyPath:     "<runtime>",
+		PrettyPaths:    logger.PrettyPaths{Abs: "<runtime>", Rel: "<runtime>"},
 		IdentifierName: "runtime",
 		Contents:       text,
 	}

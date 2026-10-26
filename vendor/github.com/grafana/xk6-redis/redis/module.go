@@ -5,8 +5,8 @@ import (
 	"errors"
 
 	"github.com/grafana/sobek"
-	"go.k6.io/k6/js/common"
-	"go.k6.io/k6/js/modules"
+	"go.k6.io/k6/v2/js/common"
+	"go.k6.io/k6/v2/js/modules"
 )
 
 type (
@@ -42,7 +42,7 @@ func (*RootModule) NewModuleInstance(vu modules.VU) modules.Instance {
 // Exports implements the modules.Instance interface and returns
 // the exports of the JS module.
 func (mi *ModuleInstance) Exports() modules.Exports {
-	return modules.Exports{Named: map[string]interface{}{
+	return modules.Exports{Named: map[string]any{
 		"Client": mi.NewClient,
 	}}
 }
