@@ -1,3 +1,17 @@
+# MinLZ 
+
+I have taken the experiences from this library and created a backwards compatible compression package called MinLZ.
+
+That package will seamlessly decode S2 content, making the transition from this package fairly trivial.
+
+There are many improvements to pretty much all aspects of S2 since we have "broken free" of the Snappy format specification.
+You can read a writeup on [Design and Improvements over S2](https://gist.github.com/klauspost/a25b66198cdbdf7b5b224f670c894ed5).
+
+The only aspect not covered is custom dictionary encoding. While I do intend to fix errors in this package, 
+I do not expect to make significant improvements, since I consider MinLZ a better basis for going forward.
+
+See https://github.com/minio/minlz for all details. 
+
 # S2 Compression
 
 S2 is an extension of [Snappy](https://github.com/google/snappy).
@@ -150,6 +164,7 @@ To build binaries to the current folder use:
 
 `go build github.com/klauspost/compress/s2/cmd/s2c && go build github.com/klauspost/compress/s2/cmd/s2d`
 
+With `-safe`, output uses exclusive creation and fails if any directory entry, including a dangling symbolic link, already exists at the destination.
 
 ## s2c
 
@@ -304,11 +319,11 @@ This functionality is disabled with stdin/stdout.
 
 If you wrap a TAR file you can specify `-untar` to make it untar on the destination host.
 
-Files are extracted to the current folder with the path specified in the tar file.
+Files are extracted under the selected destination directory (the current directory by default, or the optional output path).
 
 Note that tar files are not validated before they are wrapped.
 
-For security reasons files that move below the root folder are not allowed.
+Extraction operations are confined to that directory, so archive contents cannot write outside the selected root.
 
 # Performance
 
@@ -642,8 +657,9 @@ Compressing First 64KB of all `.go` files in `go/src`, Go 1.19.5, 8912 files, 51
 
 ### Creating Dictionaries
 
-There are no tools to create dictionaries in S2. 
-However, there are multiple ways to create a useful dictionary:
+The *experimental* [dictionary builder](https://github.com/klauspost/compress/tree/master/dict) can create S2 dictionaries with `dict.BuildS2Dict` or `builddict -format s2`.
+S2 dictionaries are at most 64KB, so set `-len` or `MaxDictSize` to 65536 (`s2.MaxDictSize`) or less.
+There are also other ways to create a useful dictionary:
 
 #### Using a Sample File
 
